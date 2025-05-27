@@ -28,9 +28,15 @@ func main() {
 		log.Fatal("Error: Interface1 and Interface2 cannot be the same")
 	}
 
-	// Fixed configuration: if1 is always near-end, if2 is always far-end
-	if1IsNearEnd := true
-	if2IsNearEnd := false
+	// Create forwarder configuration
+	config := net.ForwarderConfig{
+		Interface1:   *interface1,
+		Interface2:   *interface2,
+		Debug:        *debug,
+		If1IsNearEnd: true,  // if1 is always near-end
+		If2IsNearEnd: false, // if2 is always far-end
+	}
+
 	log.Printf("Configuration: %s is near-end (direct connection), %s is far-end (MCU)", *interface1, *interface2)
 
 	log.Printf("=== TurboRelay Network Packet Forwarder ===")
@@ -41,8 +47,8 @@ func main() {
 	log.Printf("Function: Bidirectional packet forwarding between two network interfaces")
 	log.Printf("Note: This program requires root privileges to access network interfaces")
 
-	// Create forwarder
-	forwarder := net.NewForwarder(*interface1, *interface2, *debug, if1IsNearEnd, if2IsNearEnd)
+	// Create forwarder using the interface
+	forwarder := net.NewPacketForwarder(config)
 
 	// Start forwarder
 	if err := forwarder.Start(); err != nil {
@@ -59,6 +65,19 @@ func main() {
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal: %v, stopping...", sig)
+
+		// Print final statistics before stopping
+		stats := forwarder.GetStats()
+		log.Printf("=== Final Statistics ===")
+		log.Printf("Total packets: %d, Success: %d, Errors: %d, Loss rate: %.2f%%",
+			stats.TotalPackets, stats.TotalSuccess, stats.TotalErrors, stats.OverallLossRate)
+		log.Printf("If1->If2: %d packets, %d success, %d errors, %.2f%% loss",
+			stats.If1ToIf2Stats.PacketCount, stats.If1ToIf2Stats.SuccessCount,
+			stats.If1ToIf2Stats.ErrorCount, stats.If1ToIf2Stats.LossRate)
+		log.Printf("If2->If1: %d packets, %d success, %d errors, %.2f%% loss",
+			stats.If2ToIf1Stats.PacketCount, stats.If2ToIf1Stats.SuccessCount,
+			stats.If2ToIf1Stats.ErrorCount, stats.If2ToIf1Stats.LossRate)
+
 		forwarder.Stop()
 		log.Printf("TurboRelay stopped successfully")
 		os.Exit(0)

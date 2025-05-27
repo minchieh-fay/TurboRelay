@@ -3,6 +3,7 @@ package net
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -19,6 +20,11 @@ type Forwarder struct {
 	if2IsNearEnd bool
 	handle1      *pcap.Handle
 	handle2      *pcap.Handle
+
+	// Statistics
+	mutex         sync.RWMutex
+	if1ToIf2Stats DirectionStats
+	if2ToIf1Stats DirectionStats
 }
 
 // NewForwarder creates a new forwarder
@@ -29,7 +35,25 @@ func NewForwarder(interface1, interface2 string, debug bool, if1IsNearEnd, if2Is
 		debug:        debug,
 		if1IsNearEnd: if1IsNearEnd,
 		if2IsNearEnd: if2IsNearEnd,
+		if1ToIf2Stats: DirectionStats{
+			SourceInterface: interface1,
+			DestInterface:   interface2,
+			EndType:         getEndType(if1IsNearEnd),
+		},
+		if2ToIf1Stats: DirectionStats{
+			SourceInterface: interface2,
+			DestInterface:   interface1,
+			EndType:         getEndType(if2IsNearEnd),
+		},
 	}
+}
+
+// getEndType returns the end type string based on isNearEnd flag
+func getEndType(isNearEnd bool) string {
+	if isNearEnd {
+		return "近端(直连设备)"
+	}
+	return "远端(MCU)"
 }
 
 // Start starts the forwarder
@@ -103,21 +127,24 @@ func (f *Forwarder) Stop() {
 
 // forwardPackets forwards packets between interfaces
 func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterface, dstInterface string, isNearEnd bool) {
-	endType := "远端(MCU)"
-	if isNearEnd {
-		endType = "近端(直连设备)"
-	}
+	endType := getEndType(isNearEnd)
 	log.Printf("Starting packet forwarding goroutine: %s -> %s (%s)", srcInterface, dstInterface, endType)
 
 	packetSource := gopacket.NewPacketSource(srcHandle, srcHandle.LinkType())
 	packetSource.NoCopy = true
 
-	packetCount := 0
-	successCount := 0
-	errorCount := 0
+	// Determine which stats to update
+	var stats *DirectionStats
+	if srcInterface == f.interface1 {
+		stats = &f.if1ToIf2Stats
+	} else {
+		stats = &f.if2ToIf1Stats
+	}
 
 	for packet := range packetSource.Packets() {
-		packetCount++
+		f.mutex.Lock()
+		stats.PacketCount++
+		f.mutex.Unlock()
 
 		if packet.ErrorLayer() != nil {
 			if f.debug {
@@ -148,37 +175,57 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 			isARP = true
 		}
 
+		// Update packet type statistics
+		f.mutex.Lock()
+		if isICMP {
+			stats.ICMPCount++
+		} else if isARP {
+			stats.ARPCount++
+		} else {
+			stats.OtherCount++
+		}
+		f.mutex.Unlock()
+
 		// Forward packet
 		if err := f.writePacket(dstHandle, data); err != nil {
-			errorCount++
+			f.mutex.Lock()
+			stats.ErrorCount++
+			f.mutex.Unlock()
+
 			log.Printf("Failed to forward packet %s -> %s (%s): %v", srcInterface, dstInterface, endType, err)
 
 			// 对于远端连接，丢包是预期的，不需要过多报错
-			if !isNearEnd && errorCount%100 == 1 {
-				log.Printf("远端连接丢包统计: %d/%d packets lost", errorCount, packetCount)
+			if !isNearEnd && stats.ErrorCount%100 == 1 {
+				log.Printf("远端连接丢包统计: %d/%d packets lost", stats.ErrorCount, stats.PacketCount)
 			}
 			continue
 		}
 
-		successCount++
+		f.mutex.Lock()
+		stats.SuccessCount++
+		f.mutex.Unlock()
 
 		// Log packet info - show all ICMP and ARP packets, and every 50th packet for others
 		if 1 == 2 { // 暂时不打印
-			if isICMP || isARP || f.debug || packetCount%50 == 1 {
-				f.logPacketInfo(packet, srcInterface, dstInterface, packetCount)
+			if isICMP || isARP || f.debug || stats.PacketCount%50 == 1 {
+				f.logPacketInfo(packet, srcInterface, dstInterface, int(stats.PacketCount))
 			}
 		}
 
 		// 定期报告统计信息
-		if packetCount%1000 == 0 {
-			lossRate := float64(errorCount) / float64(packetCount) * 100
+		if stats.PacketCount%1000 == 0 {
+			f.mutex.RLock()
+			lossRate := float64(stats.ErrorCount) / float64(stats.PacketCount) * 100
 			log.Printf("转发统计 %s->%s (%s): 总计:%d 成功:%d 失败:%d 丢包率:%.2f%%",
-				srcInterface, dstInterface, endType, packetCount, successCount, errorCount, lossRate)
+				srcInterface, dstInterface, endType, stats.PacketCount, stats.SuccessCount, stats.ErrorCount, lossRate)
+			f.mutex.RUnlock()
 		}
 	}
 
+	f.mutex.RLock()
 	log.Printf("Packet forwarding goroutine ended: %s -> %s (%s)", srcInterface, dstInterface, endType)
-	log.Printf("最终统计: 总计:%d 成功:%d 失败:%d", packetCount, successCount, errorCount)
+	log.Printf("最终统计: 总计:%d 成功:%d 失败:%d", stats.PacketCount, stats.SuccessCount, stats.ErrorCount)
+	f.mutex.RUnlock()
 }
 
 // writePacket writes packet data
@@ -262,4 +309,45 @@ func (f *Forwarder) logPacketInfo(packet gopacket.Packet, srcInterface, dstInter
 	log.Printf("[%s] #%d %s->%s: %s %s%s -> %s%s (%d bytes)%s",
 		timestamp, packetCount, srcInterface, dstInterface, protocol,
 		srcIP, srcPort, dstIP, dstPort, length, extraInfo)
+}
+
+// GetStats returns forwarding statistics
+func (f *Forwarder) GetStats() ForwardingStats {
+	f.mutex.RLock()
+	defer f.mutex.RUnlock()
+
+	// Calculate loss rates
+	if f.if1ToIf2Stats.PacketCount > 0 {
+		f.if1ToIf2Stats.LossRate = float64(f.if1ToIf2Stats.ErrorCount) / float64(f.if1ToIf2Stats.PacketCount) * 100
+	}
+	if f.if2ToIf1Stats.PacketCount > 0 {
+		f.if2ToIf1Stats.LossRate = float64(f.if2ToIf1Stats.ErrorCount) / float64(f.if2ToIf1Stats.PacketCount) * 100
+	}
+
+	// Calculate totals
+	totalPackets := f.if1ToIf2Stats.PacketCount + f.if2ToIf1Stats.PacketCount
+	totalSuccess := f.if1ToIf2Stats.SuccessCount + f.if2ToIf1Stats.SuccessCount
+	totalErrors := f.if1ToIf2Stats.ErrorCount + f.if2ToIf1Stats.ErrorCount
+
+	var overallLossRate float64
+	if totalPackets > 0 {
+		overallLossRate = float64(totalErrors) / float64(totalPackets) * 100
+	}
+
+	return ForwardingStats{
+		If1ToIf2Stats:   f.if1ToIf2Stats,
+		If2ToIf1Stats:   f.if2ToIf1Stats,
+		TotalPackets:    totalPackets,
+		TotalSuccess:    totalSuccess,
+		TotalErrors:     totalErrors,
+		OverallLossRate: overallLossRate,
+	}
+}
+
+// SetDebugMode enables or disables debug mode
+func (f *Forwarder) SetDebugMode(enabled bool) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.debug = enabled
+	log.Printf("Debug mode %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
 }
