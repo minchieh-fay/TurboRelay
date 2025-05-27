@@ -1,2 +1,0 @@
-# TurboRelay
-udp to tcp
