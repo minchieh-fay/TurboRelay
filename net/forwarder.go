@@ -9,6 +9,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+
+	"turborelay/rtp"
 )
 
 // Forwarder network packet forwarder
@@ -21,6 +23,9 @@ type Forwarder struct {
 	handle1      *pcap.Handle
 	handle2      *pcap.Handle
 
+	// RTP processor
+	rtpManager *rtp.ProcessorManager
+
 	// Statistics
 	mutex         sync.RWMutex
 	if1ToIf2Stats DirectionStats
@@ -29,12 +34,25 @@ type Forwarder struct {
 
 // NewForwarder creates a new forwarder
 func NewForwarder(interface1, interface2 string, debug bool, if1IsNearEnd, if2IsNearEnd bool) *Forwarder {
-	return &Forwarder{
+	// 创建RTP处理器配置
+	rtpConfig := rtp.ProcessorConfig{
+		NearEndInterface: interface1,             // if1固定为近端
+		FarEndInterface:  interface2,             // if2固定为远端
+		BufferDuration:   200 * time.Millisecond, // 近端缓存200ms
+		NACKTimeout:      30 * time.Millisecond,  // NACK超时30ms，更快响应
+		Debug:            debug,
+	}
+
+	// 创建RTP处理器管理器
+	rtpManager := rtp.NewProcessorManager(rtpConfig)
+
+	forwarder := &Forwarder{
 		interface1:   interface1,
 		interface2:   interface2,
 		debug:        debug,
 		if1IsNearEnd: if1IsNearEnd,
 		if2IsNearEnd: if2IsNearEnd,
+		rtpManager:   rtpManager,
 		if1ToIf2Stats: DirectionStats{
 			SourceInterface: interface1,
 			DestInterface:   interface2,
@@ -46,14 +64,36 @@ func NewForwarder(interface1, interface2 string, debug bool, if1IsNearEnd, if2Is
 			EndType:         getEndType(if2IsNearEnd),
 		},
 	}
+
+	// 设置RTP包发送回调函数
+	sender := rtp.NewPacketSender(func(data []byte, toInterface string) error {
+		// 根据目标接口选择对应的handle
+		var targetHandle *pcap.Handle
+		if toInterface == interface1 {
+			targetHandle = forwarder.handle1
+		} else if toInterface == interface2 {
+			targetHandle = forwarder.handle2
+		} else {
+			return fmt.Errorf("unknown target interface: %s", toInterface)
+		}
+
+		if targetHandle == nil {
+			return fmt.Errorf("target handle not initialized for interface: %s", toInterface)
+		}
+
+		return forwarder.writePacket(targetHandle, data)
+	})
+	rtpManager.SetPacketSender(sender)
+
+	return forwarder
 }
 
 // getEndType returns the end type string based on isNearEnd flag
 func getEndType(isNearEnd bool) string {
 	if isNearEnd {
-		return "近端(直连设备)"
+		return "Near-end (Direct Device)"
 	}
-	return "远端(MCU)"
+	return "Far-end (MCU)"
 }
 
 // Start starts the forwarder
@@ -104,6 +144,14 @@ func (f *Forwarder) Start() error {
 	log.Printf("Starting bidirectional packet forwarding: %s <-> %s", f.interface1, f.interface2)
 	log.Printf("BPF filter applied: %s", filter)
 
+	// 启动RTP处理器
+	log.Printf("Starting RTP processor...")
+	if err := f.rtpManager.Start(); err != nil {
+		log.Printf("Warning: failed to start RTP processor: %v", err)
+	} else {
+		log.Printf("RTP processor started successfully")
+	}
+
 	// Start bidirectional forwarding
 	go f.forwardPackets(f.handle1, f.handle2, f.interface1, f.interface2, f.if1IsNearEnd)
 	go f.forwardPackets(f.handle2, f.handle1, f.interface2, f.interface1, f.if2IsNearEnd)
@@ -115,6 +163,14 @@ func (f *Forwarder) Start() error {
 // Stop stops the forwarder
 func (f *Forwarder) Stop() {
 	log.Printf("Stopping TurboRelay...")
+
+	// 停止RTP处理器
+	if f.rtpManager != nil {
+		log.Printf("Stopping RTP processor...")
+		f.rtpManager.Stop()
+		log.Printf("RTP processor stopped")
+	}
+
 	if f.handle1 != nil {
 		f.handle1.Close()
 		log.Printf("Closed interface %s", f.interface1)
@@ -186,6 +242,31 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 		}
 		f.mutex.Unlock()
 
+		// RTP处理：在writePacket之前劫持UDP包
+		shouldForward := true
+		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+			// 这是UDP包，让RTP处理器分析
+			isNearEnd := (srcInterface == f.interface1) // if1固定为近端
+
+			processed, err := f.rtpManager.ProcessPacket(packet, isNearEnd)
+			if err != nil {
+				if f.debug {
+					log.Printf("RTP processing error: %v", err)
+				}
+				// 出错时仍然转发包
+			} else {
+				shouldForward = processed
+				if f.debug && !shouldForward {
+					log.Printf("RTP processor decided not to forward UDP packet")
+				}
+			}
+		}
+
+		// 如果RTP处理器决定不转发，跳过此包
+		if !shouldForward {
+			continue
+		}
+
 		// Forward packet
 		if err := f.writePacket(dstHandle, data); err != nil {
 			f.mutex.Lock()
@@ -196,7 +277,7 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 
 			// 对于远端连接，丢包是预期的，不需要过多报错
 			if !isNearEnd && stats.ErrorCount%100 == 1 {
-				log.Printf("远端连接丢包统计: %d/%d packets lost", stats.ErrorCount, stats.PacketCount)
+				log.Printf("Far-end connection packet loss stats: %d/%d packets lost", stats.ErrorCount, stats.PacketCount)
 			}
 			continue
 		}
@@ -216,7 +297,7 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 		if stats.PacketCount%1000 == 0 {
 			f.mutex.RLock()
 			lossRate := float64(stats.ErrorCount) / float64(stats.PacketCount) * 100
-			log.Printf("转发统计 %s->%s (%s): 总计:%d 成功:%d 失败:%d 丢包率:%.2f%%",
+			log.Printf("Forwarding stats %s->%s (%s): Total:%d Success:%d Failed:%d Loss:%.2f%%",
 				srcInterface, dstInterface, endType, stats.PacketCount, stats.SuccessCount, stats.ErrorCount, lossRate)
 			f.mutex.RUnlock()
 		}
@@ -224,7 +305,7 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 
 	f.mutex.RLock()
 	log.Printf("Packet forwarding goroutine ended: %s -> %s (%s)", srcInterface, dstInterface, endType)
-	log.Printf("最终统计: 总计:%d 成功:%d 失败:%d", stats.PacketCount, stats.SuccessCount, stats.ErrorCount)
+	log.Printf("Final stats: Total:%d Success:%d Failed:%d", stats.PacketCount, stats.SuccessCount, stats.ErrorCount)
 	f.mutex.RUnlock()
 }
 

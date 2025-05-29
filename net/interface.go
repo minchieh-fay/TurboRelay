@@ -34,7 +34,7 @@ type ForwardingStats struct {
 type DirectionStats struct {
 	SourceInterface string  `json:"source_interface"`
 	DestInterface   string  `json:"dest_interface"`
-	EndType         string  `json:"end_type"` // "近端(直连设备)" or "远端(MCU)"
+	EndType         string  `json:"end_type"` // "Near-end (Direct Device)" or "Far-end (MCU)"
 	PacketCount     uint64  `json:"packet_count"`
 	SuccessCount    uint64  `json:"success_count"`
 	ErrorCount      uint64  `json:"error_count"`
