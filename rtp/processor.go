@@ -4,8 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"net"
-	"sort"
 	"sync"
 	"time"
 
@@ -84,15 +82,12 @@ func (p *Processor) Start() error {
 	p.cleanupTicker = time.NewTicker(30 * time.Second) // 每30秒清理一次
 	go p.cleanupRoutine()
 
-	// Start NACK timeout routine
-	go p.nackTimeoutRoutine()
-
 	p.started = true
 	logf("RTP processor started with buffer duration: %v, NACK timeout: %v",
 		p.config.BufferDuration, p.config.NACKTimeout)
 
 	// 验证序列号处理逻辑
-	if p.config.Debug {
+	if 1 == 2 && p.config.Debug {
 		if p.validateSequenceLogic() {
 			p.testSequenceHandling()
 		}
@@ -219,12 +214,12 @@ func (p *Processor) processRTPPacket(packet gopacket.Packet, payload []byte, isN
 	}
 
 	// Update session info
-	p.updateSessionInfo(packet, sessionKey, header, true)
+	seqdiff := p.updateSessionInfo(packet, sessionKey, header, true)
 
 	if isNearEnd {
 		return p.processNearEndRTP(packet, sessionKey, header)
 	} else {
-		return p.processFarEndRTP(packet, sessionKey, header)
+		return p.processFarEndRTP(packet, sessionKey, header, seqdiff)
 	}
 }
 
@@ -332,14 +327,13 @@ func (p *Processor) processNearEndRTP(packet gopacket.Packet, sessionKey Session
 }
 
 // processFarEndRTP processes RTP packet from far-end (if2 -> if1)
-func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader) (bool, error) {
-	// 远端包：使用序列号窗口进行排序处理，检查丢包
+func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, seqdiff int) (bool, error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
 	session := p.sessions[sessionKey]
 	if session == nil {
-		// 新会话，直接转发并初始化序列号窗口
+		// 新会话，直接转发
 		p.stats.FarEndStats.ReceivedPackets++
 		p.stats.FarEndStats.ForwardedPackets++
 
@@ -354,80 +348,38 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 	p.stats.FarEndStats.ReceivedPackets++
 	currentSeq := header.SequenceNumber
 
-	// 初始化序列号窗口（如果还没有）
-	if session.SeqWindow == nil {
-		session.SeqWindow = p.newSequenceWindow(currentSeq)
-		session.MaxSeq = currentSeq
-		p.stats.FarEndStats.ForwardedPackets++
-
+	// 检查并清理对应的NACK跟踪（包已收到）
+	if _, exists := session.ActiveNACKs[currentSeq]; exists {
+		delete(session.ActiveNACKs, currentSeq)
 		if p.config.Debug {
-			logf("Far-end RTP: SSRC=%d, Seq=%d, initializing window, forwarding",
+			logf("Far-end RTP: SSRC=%d, Seq=%d, packet received, stopping NACK tracking",
 				header.SSRC, currentSeq)
 		}
-
-		return true, nil
 	}
 
-	// 使用序列号窗口处理包
-	shouldForward, isNewPacket := p.updateSequenceWindow(session.SeqWindow, currentSeq)
+	// TODO: 用户将手动实现简单的丢包检测逻辑, seqdiff > 1 表示丢（乱序）了seqdiff-1个包
+	// 举例： 原先是 6， currentSeq=9， seqdiff=3，表示丢（乱序）了2个包：7，8
+	if seqdiff > 1 {
+		for i := 1; i < seqdiff; i++ {
+			nackinfo := &NACKInfo{
+				SequenceNumber: currentSeq - uint16(i),
+				FirstNACKTime:  time.Now(),
+				RetryCount:     0,
+				MaxRetries:     3,
+				GiveUpTime:     time.Now().Add(time.Second * 5),
+			}
+			session.ActiveNACKs[currentSeq-uint16(i)] = nackinfo
+			go p.scheduleNACK(session, nackinfo, sessionKey)
+		}
+	}
 
+	// 远端包直接转发给近端
+	p.stats.FarEndStats.ForwardedPackets++
 	if p.config.Debug {
-		windowStatus := p.getWindowStatus(session.SeqWindow)
-		offset := p.calculateSeqDiff(currentSeq, session.SeqWindow.BaseSeq)
-		if header.SSRC != 0 {
-			logf("Far-end RTP: SSRC=%d, Seq=%d, Offset=%d, Forward=%t, New=%t, Window=[%s]",
-				header.SSRC, currentSeq, offset, shouldForward, isNewPacket, windowStatus)
-		}
+		logf("Far-end RTP: SSRC=%d, Seq=%d, forwarding directly to near-end",
+			header.SSRC, currentSeq)
 	}
-
-	if !isNewPacket {
-		// 重复包或太旧的包
-		p.stats.FarEndStats.DroppedPackets++
-		if p.config.Debug && header.SSRC != 0 {
-			logf("Far-end RTP: SSRC=%d, Seq=%d (duplicate/too old), dropping",
-				header.SSRC, currentSeq)
-		}
-		return true, nil
-	}
-
-	// 更新最大序列号
-	if p.isSeqNewer(currentSeq, session.MaxSeq) {
-		session.MaxSeq = currentSeq
-	}
-
-	if shouldForward {
-		// 可以立即转发
-		p.stats.FarEndStats.ForwardedPackets++
-
-		if p.config.Debug {
-			logf("Far-end RTP: SSRC=%d, Seq=%d, forwarding immediately",
-				header.SSRC, currentSeq)
-		}
-
-		// 检查是否可以转发缓存中的后续包
-		p.forwardConsecutiveBufferedPacketsWithWindow(sessionKey)
-
-		return true, nil
-	} else {
-		// 需要缓存等待前面的包
-		bufferedPacket := &BufferedPacket{
-			Data:      packet.Data(),
-			Header:    header,
-			Timestamp: time.Now(),
-			Interface: p.config.FarEndInterface,
-		}
-
-		p.farEndBuffer[sessionKey] = append(p.farEndBuffer[sessionKey], bufferedPacket)
-		p.stats.FarEndStats.BufferedPackets++
-
-		if p.config.Debug {
-			missing := p.getMissingSequences(session.SeqWindow)
-			logf("Far-end RTP: SSRC=%d, Seq=%d, buffering (missing: %v, buffer_size: %d)",
-				header.SSRC, currentSeq, missing, len(p.farEndBuffer[sessionKey]))
-		}
-
-		return false, nil
-	}
+	return true, nil
 }
 
 // calculateSeqDiff calculates sequence number difference considering wrap-around
@@ -495,221 +447,18 @@ func (p *Processor) seqInRange(seq, start, end uint16) bool {
 	}
 }
 
-// newSequenceWindow 创建新的序列号窗口
-func (p *Processor) newSequenceWindow(baseSeq uint16) *SequenceWindow {
-	return &SequenceWindow{
-		BaseSeq:      baseSeq,
-		WindowSize:   32, // 使用32位窗口
-		ReceivedMask: 1,  // 标记baseSeq已接收
-		MaxSeq:       baseSeq,
-		LastUpdate:   time.Now(),
-	}
-}
-
-// updateSequenceWindow 更新序列号窗口
-func (p *Processor) updateSequenceWindow(window *SequenceWindow, seq uint16) (bool, bool) {
-	// 返回值：(是否应该转发, 是否是新包)
-
-	if window == nil {
-		return false, false
-	}
-
-	window.LastUpdate = time.Now()
-
-	// 计算序列号相对于窗口基准的偏移
-	offset := p.calculateSeqDiff(seq, window.BaseSeq)
-
-	// 情况1：序列号在当前窗口内
-	if offset >= 0 && offset < window.WindowSize {
-		// 检查是否已经接收过
-		mask := uint32(1) << offset
-		if window.ReceivedMask&mask != 0 {
-			// 重复包
-			return false, false
-		}
-
-		// 标记为已接收
-		window.ReceivedMask |= mask
-
-		// 更新最大序列号
-		if p.isSeqNewer(seq, window.MaxSeq) {
-			window.MaxSeq = seq
-		}
-
-		// 检查是否可以转发（前面的包都已接收）
-		canForward := p.canForwardFromWindow(window, seq)
-		return canForward, true
-	}
-
-	// 情况2：序列号在窗口前面（乱序的旧包）
-	if offset < 0 && offset >= -window.WindowSize {
-		// 这是一个乱序包，但在合理范围内
-		// 需要扩展窗口向前
-		p.expandWindowBackward(window, seq)
-
-		// 乱序包不能直接转发，需要检查是否能填补空隙
-		canForward := p.canForwardFromWindow(window, seq)
-		return canForward, true
-	}
-
-	// 情况3：序列号在窗口后面（新包，需要滑动窗口）
-	if offset >= window.WindowSize {
-		// 检查跳跃是否合理
-		if offset <= window.WindowSize*3 { // 允许3倍窗口大小的跳跃
-			// 滑动窗口
-			p.slideWindow(window, seq)
-
-			// 新包需要等待前面的包，不能直接转发
-			return false, true
-		} else {
-			// 跳跃太大，重置窗口
-			p.resetWindow(window, seq)
-			return true, true // 重置后直接转发
-		}
-	}
-
-	// 情况4：太旧的包，直接丢弃
-	return false, false
-}
-
-// canForwardFromWindow 检查是否可以从窗口转发包
-func (p *Processor) canForwardFromWindow(window *SequenceWindow, seq uint16) bool {
-	offset := p.calculateSeqDiff(seq, window.BaseSeq)
-
-	// 检查从baseSeq到当前seq的所有包是否都已接收
-	for i := 0; i <= offset; i++ {
-		mask := uint32(1) << i
-		if window.ReceivedMask&mask == 0 {
-			// 有包缺失，不能转发
-			return false
-		}
-	}
-
-	return true
-}
-
-// expandWindowBackward 向前扩展窗口以容纳乱序包
-func (p *Processor) expandWindowBackward(window *SequenceWindow, seq uint16) {
-	diff := p.calculateSeqDiff(window.BaseSeq, seq)
-	if diff <= 0 {
-		return
-	}
-
-	// 向前移动窗口基准到新的序列号
-	newBaseSeq := seq
-
-	// 计算需要移动的位数
-	shiftAmount := diff
-
-	// 重新计算接收掩码
-	oldMask := window.ReceivedMask
-	newMask := uint32(1) // 标记新的baseSeq（当前seq）已接收
-
-	// 将旧掩码中的位向右移动相应位数
-	if shiftAmount < window.WindowSize {
-		// 将旧的接收状态向右移动
-		newMask |= (oldMask << shiftAmount)
-
-		// 确保不超出窗口大小
-		windowMask := uint32((1 << window.WindowSize) - 1)
-		newMask &= windowMask
-	}
-
-	window.BaseSeq = newBaseSeq
-	window.ReceivedMask = newMask
-
-	if p.config.Debug {
-		logf("Expanded window backward: BaseSeq=%d->%d, Mask=0x%08x->0x%08x, Shift=%d",
-			window.BaseSeq+uint16(diff), newBaseSeq, oldMask, newMask, shiftAmount)
-	}
-}
-
-// slideWindow 滑动窗口以容纳新的序列号
-func (p *Processor) slideWindow(window *SequenceWindow, seq uint16) {
-	offset := p.calculateSeqDiff(seq, window.BaseSeq)
-	slideAmount := offset - window.WindowSize + 1
-
-	if slideAmount <= 0 {
-		return
-	}
-
-	// 滑动窗口基准
-	window.BaseSeq = uint16((int(window.BaseSeq) + slideAmount) % 65536)
-
-	// 右移接收掩码
-	window.ReceivedMask >>= slideAmount
-
-	// 标记新序列号已接收
-	newOffset := p.calculateSeqDiff(seq, window.BaseSeq)
-	if newOffset >= 0 && newOffset < window.WindowSize {
-		window.ReceivedMask |= (1 << newOffset)
-	}
-
-	// 更新最大序列号
-	if p.isSeqNewer(seq, window.MaxSeq) {
-		window.MaxSeq = seq
-	}
-}
-
-// resetWindow 重置窗口
-func (p *Processor) resetWindow(window *SequenceWindow, seq uint16) {
-	window.BaseSeq = seq
-	window.ReceivedMask = 1 // 只标记当前序列号已接收
-	window.MaxSeq = seq
-}
-
-// getMissingSequences 获取窗口中缺失的序列号
-func (p *Processor) getMissingSequences(window *SequenceWindow) []uint16 {
-	var missing []uint16
-
-	if window == nil {
-		return missing
-	}
-
-	// 检查从baseSeq到maxSeq之间缺失的序列号
-	maxOffset := p.calculateSeqDiff(window.MaxSeq, window.BaseSeq)
-	if maxOffset < 0 || maxOffset >= window.WindowSize {
-		return missing
-	}
-
-	for i := 0; i <= maxOffset; i++ {
-		mask := uint32(1) << i
-		if window.ReceivedMask&mask == 0 {
-			// 这个序列号缺失
-			missingSeq := uint16((int(window.BaseSeq) + i) % 65536)
-			missing = append(missing, missingSeq)
-		}
-	}
-
-	return missing
-}
-
-// getWindowStatus 获取窗口状态（用于调试）
-func (p *Processor) getWindowStatus(window *SequenceWindow) string {
-	if window == nil {
-		return "nil"
-	}
-
-	missing := p.getMissingSequences(window)
-	return fmt.Sprintf("Base:%d Max:%d Mask:0x%08x Missing:%v",
-		window.BaseSeq, window.MaxSeq, window.ReceivedMask, missing)
-}
-
-// updateSessionInfo updates session information
-func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, isRTP bool) {
+// updateSessionInfo updates session information，
+// return seq diff = rtp: if from far-end, return seq diff, if from near-end, return 0
+func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, isRTP bool) int {
 	now := time.Now()
 
 	session := p.sessions[sessionKey]
 	if session == nil {
 		session = &SessionInfo{
-			SSRC:     header.SSRC,
-			LastSeen: now,
-			MaxSeq:   header.SequenceNumber,
-		}
-
-		// 为远端会话初始化序列号窗口
-		if sessionKey.Direction == DirectionFarToNear && isRTP {
-			session.SeqWindow = p.newSequenceWindow(header.SequenceNumber)
+			SSRC:        header.SSRC,
+			LastSeen:    now,
+			MaxSeq:      header.SequenceNumber,
+			ActiveNACKs: make(map[uint16]*NACKInfo), // 初始化NACK跟踪
 		}
 
 		p.sessions[sessionKey] = session
@@ -727,13 +476,16 @@ func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey Session
 		session.RTPInfo = streamInfo
 		if sessionKey.Direction == DirectionFarToNear {
 			// Update sequence tracking for far-end packets
-			if p.calculateSeqDiff(header.SequenceNumber, session.MaxSeq) > 0 {
+			seqdiff := p.calculateSeqDiff(header.SequenceNumber, session.MaxSeq)
+			if seqdiff > 0 {
 				session.MaxSeq = header.SequenceNumber
+				return seqdiff
 			}
 		}
 	} else {
 		session.RTCPInfo = streamInfo
 	}
+	return 0
 }
 
 // extractStreamInfo extracts network information from packet
@@ -794,6 +546,75 @@ func (p *Processor) GetStats() ProcessorStats {
 	return stats
 }
 
+// GetActiveNACKs returns information about currently active NACK requests
+func (p *Processor) GetActiveNACKs() map[SessionKey]map[uint16]*NACKInfo {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	result := make(map[SessionKey]map[uint16]*NACKInfo)
+
+	for sessionKey, session := range p.sessions {
+		if session.ActiveNACKs != nil && len(session.ActiveNACKs) > 0 {
+			// 创建副本避免并发访问问题
+			nackCopy := make(map[uint16]*NACKInfo)
+			for seq, nackInfo := range session.ActiveNACKs {
+				nackCopy[seq] = &NACKInfo{
+					SequenceNumber: nackInfo.SequenceNumber,
+					FirstNACKTime:  nackInfo.FirstNACKTime,
+					LastNACKTime:   nackInfo.LastNACKTime,
+					RetryCount:     nackInfo.RetryCount,
+					MaxRetries:     nackInfo.MaxRetries,
+					GiveUpTime:     nackInfo.GiveUpTime,
+				}
+			}
+			result[sessionKey] = nackCopy
+		}
+	}
+
+	return result
+}
+
+// GetNACKStats returns NACK statistics summary
+func (p *Processor) GetNACKStats() map[uint32]struct {
+	ActiveNACKCount int
+	OldestNACKAge   time.Duration
+	TotalRetries    int
+} {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	result := make(map[uint32]struct {
+		ActiveNACKCount int
+		OldestNACKAge   time.Duration
+		TotalRetries    int
+	})
+
+	now := time.Now()
+
+	for sessionKey, session := range p.sessions {
+		if session.ActiveNACKs == nil {
+			continue
+		}
+
+		ssrc := sessionKey.SSRC
+		stats := result[ssrc]
+
+		for _, nackInfo := range session.ActiveNACKs {
+			stats.ActiveNACKCount++
+			stats.TotalRetries += nackInfo.RetryCount
+
+			age := now.Sub(nackInfo.FirstNACKTime)
+			if age > stats.OldestNACKAge {
+				stats.OldestNACKAge = age
+			}
+		}
+
+		result[ssrc] = stats
+	}
+
+	return result
+}
+
 // cleanupRoutine periodically cleans up expired sessions
 func (p *Processor) cleanupRoutine() {
 	for {
@@ -825,6 +646,17 @@ func (p *Processor) cleanupExpiredSessions() {
 
 	// Remove expired sessions
 	for _, key := range expiredKeys {
+		session := p.sessions[key]
+
+		// 清理该会话的所有活跃NACK
+		if session != nil && session.ActiveNACKs != nil {
+			nackCount := len(session.ActiveNACKs)
+			if nackCount > 0 && p.config.Debug {
+				logf("Cleaning up %d active NACKs for expired session: SSRC=%d, Direction=%d",
+					nackCount, key.SSRC, key.Direction)
+			}
+		}
+
 		delete(p.sessions, key)
 		delete(p.nearEndBuffer, key)
 		delete(p.farEndBuffer, key)
@@ -844,256 +676,6 @@ func (p *Processor) cleanupExpiredSessions() {
 	if len(expiredKeys) > 0 {
 		logf("Cleaned up %d expired RTP sessions", len(expiredKeys))
 	}
-}
-
-// nackTimeoutRoutine handles NACK timeout processing
-func (p *Processor) nackTimeoutRoutine() {
-	ticker := time.NewTicker(10 * time.Millisecond) // 检查间隔
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.stopChan:
-			return
-		case <-ticker.C:
-			p.processNACKTimeouts()
-		}
-	}
-}
-
-// processNACKTimeouts processes buffered packets that have timed out
-func (p *Processor) processNACKTimeouts() {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	now := time.Now()
-
-	for sessionKey, buffer := range p.farEndBuffer {
-		if len(buffer) == 0 {
-			continue
-		}
-
-		session := p.sessions[sessionKey]
-		if session == nil || session.SeqWindow == nil {
-			continue
-		}
-
-		// 检查是否有缺失的包需要NACK
-		missing := p.getMissingSequences(session.SeqWindow)
-		if len(missing) == 0 {
-			// 没有缺失包，检查是否可以转发缓存中的包
-			p.forwardConsecutiveBufferedPacketsWithWindow(sessionKey)
-			continue
-		}
-
-		// 检查最老的缓存包是否超时
-		oldestPacket := buffer[0]
-		timeoutDuration := now.Sub(oldestPacket.Timestamp)
-
-		if timeoutDuration > p.config.NACKTimeout {
-			// 第一次超时：发送NACK请求
-			if timeoutDuration <= p.config.NACKTimeout*3 { // 3倍超时内继续NACK，更快响应
-				for _, missingSeq := range missing {
-					p.sendNACKForSequence(sessionKey, missingSeq)
-				}
-				if p.config.Debug {
-					logf("NACK timeout: SSRC=%d, missing=%v, sent NACK requests (timeout: %v)",
-						sessionKey.SSRC, missing, timeoutDuration)
-				}
-			} else {
-				// 多次NACK失败，放弃等待，强制转发
-				if p.config.Debug {
-					logf("NACK failed after multiple attempts: SSRC=%d, missing=%v, flushing buffer (timeout: %v)",
-						sessionKey.SSRC, missing, timeoutDuration)
-				}
-				p.flushBufferedPackets(sessionKey)
-			}
-		}
-	}
-}
-
-// flushBufferedPackets sends all buffered packets for a session
-func (p *Processor) flushBufferedPackets(sessionKey SessionKey) {
-	buffer := p.farEndBuffer[sessionKey]
-	if len(buffer) == 0 {
-		return
-	}
-
-	// Sort by sequence number
-	sort.Slice(buffer, func(i, j int) bool {
-		return p.calculateSeqDiff(buffer[i].Header.SequenceNumber, buffer[j].Header.SequenceNumber) < 0
-	})
-
-	// Send all buffered packets
-	for _, bufferedPacket := range buffer {
-		if p.sender != nil {
-			targetInterface := p.config.NearEndInterface
-			if err := p.sender.SendPacket(bufferedPacket.Data, targetInterface); err != nil {
-				logf("Failed to send buffered packet: %v", err)
-				p.stats.FarEndStats.DroppedPackets++
-			} else {
-				p.stats.FarEndStats.ForwardedPackets++
-				if p.config.Debug {
-					logf("Flushed buffered packet: SSRC=%d, Seq=%d",
-						bufferedPacket.Header.SSRC, bufferedPacket.Header.SequenceNumber)
-				}
-			}
-		}
-	}
-
-	// Clear buffer
-	p.farEndBuffer[sessionKey] = nil
-}
-
-// scheduleNACKForMissing 为缺失的序列号安排NACK
-func (p *Processor) scheduleNACKForMissing(sessionKey SessionKey, missingSeq uint16) {
-	time.Sleep(p.config.NACKTimeout)
-
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	// 检查缺失的包是否已经到达
-	session := p.sessions[sessionKey]
-	if session == nil || session.SeqWindow == nil {
-		return
-	}
-
-	// 检查这个序列号是否仍然缺失
-	offset := p.calculateSeqDiff(missingSeq, session.SeqWindow.BaseSeq)
-	if offset >= 0 && offset < session.SeqWindow.WindowSize {
-		mask := uint32(1) << offset
-		if session.SeqWindow.ReceivedMask&mask == 0 {
-			// 仍然缺失，发送NACK
-			p.sendNACKForSequence(sessionKey, missingSeq)
-		}
-	}
-}
-
-// sendNACKForSequence 为单个序列号发送NACK
-func (p *Processor) sendNACKForSequence(sessionKey SessionKey, missingSeq uint16) {
-	if p.sender == nil {
-		return
-	}
-
-	session := p.sessions[sessionKey]
-	if session == nil {
-		return
-	}
-
-	// Build NACK packet
-	nackPacket := p.buildNACKPacket(sessionKey.SSRC, missingSeq, missingSeq, session)
-	if nackPacket == nil {
-		return
-	}
-
-	// Send NACK to far-end interface
-	targetInterface := p.config.FarEndInterface
-	if err := p.sender.SendPacket(nackPacket, targetInterface); err != nil {
-		logf("Failed to send NACK: %v", err)
-	} else {
-		p.stats.FarEndStats.NACKsSent++
-		if p.config.Debug {
-			logf("Sent NACK for SSRC=%d, missing seq %d", sessionKey.SSRC, missingSeq)
-		}
-	}
-}
-
-// buildNACKPacket builds an RTCP NACK packet
-func (p *Processor) buildNACKPacket(ssrc uint32, startSeq, endSeq uint16, session *SessionInfo) []byte {
-	// Use RTCP info if available, otherwise use RTP info
-	var sourcePort, destPort uint16
-	var srcIP, dstIP net.IP
-	var srcMAC, dstMAC net.HardwareAddr
-
-	if session.RTCPInfo != nil {
-		// Use RTCP port (reverse direction)
-		destPort = session.RTCPInfo.SourcePort
-		sourcePort = session.RTCPInfo.DestPort
-		srcIP = session.RTCPInfo.DestIP
-		dstIP = session.RTCPInfo.SourceIP
-		srcMAC = session.RTCPInfo.DestMAC
-		dstMAC = session.RTCPInfo.SourceMAC
-
-		if p.config.Debug {
-			logf("Using RTCP session info for NACK: %s:%d -> %s:%d",
-				srcIP, sourcePort, dstIP, destPort)
-		}
-	} else if session.RTPInfo != nil {
-		// 如果没有RTCP会话信息，直接使用RTP端口发送NACK包
-		destPort = session.RTPInfo.SourcePort // 直接使用RTP端口
-		sourcePort = session.RTPInfo.DestPort
-		srcIP = session.RTPInfo.DestIP
-		dstIP = session.RTPInfo.SourceIP
-		srcMAC = session.RTPInfo.DestMAC
-		dstMAC = session.RTPInfo.SourceMAC
-
-		if p.config.Debug {
-			logf("Using RTP session info for NACK (same port): %s:%d -> %s:%d",
-				srcIP, sourcePort, dstIP, destPort)
-		}
-	} else {
-		if p.config.Debug {
-			logf("No session info available for NACK packet construction")
-		}
-		return nil
-	}
-
-	// Build RTCP NACK packet
-	nackPayload := make([]byte, 16)
-
-	// RTCP header
-	nackPayload[0] = 0x81                               // V=2, P=0, FMT=1
-	nackPayload[1] = 205                                // PT=205 (RTCP NACK)
-	binary.BigEndian.PutUint16(nackPayload[2:4], 3)     // Length
-	binary.BigEndian.PutUint32(nackPayload[4:8], ssrc)  // Sender SSRC
-	binary.BigEndian.PutUint32(nackPayload[8:12], ssrc) // Media SSRC
-
-	// NACK FCI (Feedback Control Information)
-	binary.BigEndian.PutUint16(nackPayload[12:14], startSeq) // PID
-	binary.BigEndian.PutUint16(nackPayload[14:16], 0)        // BLP (for simplicity)
-
-	// Build complete packet using gopacket
-	eth := &layers.Ethernet{
-		SrcMAC:       srcMAC,
-		DstMAC:       dstMAC,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-
-	ip := &layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TTL:      64,
-		Protocol: layers.IPProtocolUDP,
-		SrcIP:    srcIP,
-		DstIP:    dstIP,
-	}
-
-	udp := &layers.UDP{
-		SrcPort: layers.UDPPort(sourcePort),
-		DstPort: layers.UDPPort(destPort),
-	}
-	udp.SetNetworkLayerForChecksum(ip)
-
-	// Serialize the packet
-	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: true,
-	}
-
-	if err := gopacket.SerializeLayers(buffer, opts, eth, ip, udp, gopacket.Payload(nackPayload)); err != nil {
-		if p.config.Debug {
-			logf("Failed to serialize NACK packet: %v", err)
-		}
-		return nil
-	}
-
-	if p.config.Debug {
-		logf("Built NACK packet: %s:%d -> %s:%d, SSRC=%d, Seq=%d",
-			srcIP, sourcePort, dstIP, destPort, ssrc, startSeq)
-	}
-
-	return buffer.Bytes()
 }
 
 // processNACKPacket processes an incoming NACK packet
@@ -1326,10 +908,10 @@ func (p *Processor) parseRTPHeader(payload []byte) (RTPHeader, error) {
 	return header, nil
 }
 
-// forwardConsecutiveBufferedPacketsWithWindow 使用窗口转发缓存中连续的包
+// forwardConsecutiveBufferedPacketsWithWindow 转发缓存中的包（简化版）
 func (p *Processor) forwardConsecutiveBufferedPacketsWithWindow(sessionKey SessionKey) {
 	session := p.sessions[sessionKey]
-	if session == nil || session.SeqWindow == nil {
+	if session == nil {
 		return
 	}
 
@@ -1338,64 +920,30 @@ func (p *Processor) forwardConsecutiveBufferedPacketsWithWindow(sessionKey Sessi
 		return
 	}
 
-	// 按序列号排序
-	sort.Slice(buffer, func(i, j int) bool {
-		return p.calculateSeqDiff(buffer[i].Header.SequenceNumber, buffer[j].Header.SequenceNumber) < 0
-	})
-
-	var remainingBuffer []*BufferedPacket
+	// 简化逻辑：直接转发所有缓存包
 	forwardedCount := 0
-
-	// 检查缓存中的包是否可以转发
 	for _, bufferedPacket := range buffer {
-		seq := bufferedPacket.Header.SequenceNumber
-
-		// 检查这个序列号是否在窗口中且已标记为接收
-		offset := p.calculateSeqDiff(seq, session.SeqWindow.BaseSeq)
-		if offset >= 0 && offset < session.SeqWindow.WindowSize {
-			mask := uint32(1) << offset
-			if session.SeqWindow.ReceivedMask&mask != 0 {
-				// 检查是否可以转发（前面的包都已接收）
-				if p.canForwardFromWindow(session.SeqWindow, seq) {
-					// 可以转发
-					if p.sender != nil {
-						targetInterface := p.config.NearEndInterface
-						if err := p.sender.SendPacket(bufferedPacket.Data, targetInterface); err != nil {
-							logf("Failed to send buffered packet: %v", err)
-							p.stats.FarEndStats.DroppedPackets++
-						} else {
-							p.stats.FarEndStats.ForwardedPackets++
-							forwardedCount++
-							if p.config.Debug {
-								logf("Forwarded buffered packet: SSRC=%d, Seq=%d",
-									bufferedPacket.Header.SSRC, bufferedPacket.Header.SequenceNumber)
-							}
-						}
-					}
-					continue // 不加入remainingBuffer
+		if p.sender != nil {
+			targetInterface := p.config.NearEndInterface
+			if err := p.sender.SendPacket(bufferedPacket.Data, targetInterface); err != nil {
+				logf("Failed to send buffered packet: %v", err)
+				p.stats.FarEndStats.DroppedPackets++
+			} else {
+				p.stats.FarEndStats.ForwardedPackets++
+				forwardedCount++
+				if p.config.Debug {
+					logf("Forwarded buffered packet: SSRC=%d, Seq=%d",
+						bufferedPacket.Header.SSRC, bufferedPacket.Header.SequenceNumber)
 				}
 			}
 		}
-
-		// 不能转发的包保留在缓存中
-		remainingBuffer = append(remainingBuffer, bufferedPacket)
 	}
 
-	// 更新缓存
-	p.farEndBuffer[sessionKey] = remainingBuffer
+	// 清空缓存
+	p.farEndBuffer[sessionKey] = nil
 
 	if forwardedCount > 0 && p.config.Debug {
-		logf("Forwarded %d buffered packets for SSRC=%d, %d packets remain in buffer",
-			forwardedCount, sessionKey.SSRC, len(remainingBuffer))
-	}
-}
-
-// scheduleNACK schedules a NACK request for missing packets (deprecated - use scheduleNACKForMissing)
-func (p *Processor) scheduleNACK(sessionKey SessionKey, expectedSeq, currentSeq uint16) {
-	// This function is deprecated and replaced by scheduleNACKForMissing
-	// Keep for compatibility but do nothing
-	if p.config.Debug {
-		logf("scheduleNACK called (deprecated): SSRC=%d, expected=%d, current=%d",
-			sessionKey.SSRC, expectedSeq, currentSeq)
+		logf("Forwarded %d buffered packets for SSRC=%d",
+			forwardedCount, sessionKey.SSRC)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"turborelay/net"
 )
@@ -63,6 +64,11 @@ func main() {
 
 	// Wait for signal in a separate goroutine to avoid blocking
 	go func() {
+		if 1 == 1 {
+			for {
+				time.Sleep(time.Second * 10)
+			}
+		}
 		sig := <-sigChan
 		log.Printf("Received signal: %v, stopping...", sig)
 

@@ -69,34 +69,32 @@ type EndpointStats struct {
 	OutOfOrderPackets uint64 `json:"out_of_order_packets"`
 }
 
-// SessionInfo contains information about an RTP/RTCP session
+// SessionInfo contains information about an RTP session
 type SessionInfo struct {
-	SSRC uint32 `json:"ssrc"`
-
-	// RTP information
-	RTPInfo *StreamInfo `json:"rtp_info,omitempty"`
-
-	// RTCP information
-	RTCPInfo *StreamInfo `json:"rtcp_info,omitempty"`
-
-	// Last communication timestamp
+	SSRC     uint32    `json:"ssrc"`
 	LastSeen time.Time `json:"last_seen"`
 
-	// Sequence number tracking for far-end (using sliding window)
-	SeqWindow    *SequenceWindow `json:"seq_window,omitempty"`
-	MaxSeq       uint16          `json:"max_seq"`
-	BaseSeq      uint16          `json:"base_seq"`      // 窗口基准序列号
-	WindowSize   int             `json:"window_size"`   // 窗口大小
-	ReceivedMask uint32          `json:"received_mask"` // 接收位掩码（32位窗口）
+	// Sequence tracking
+	MaxSeq uint16 `json:"max_seq"`
+
+	// Network information
+	RTPInfo  *StreamInfo `json:"rtp_info,omitempty"`
+	RTCPInfo *StreamInfo `json:"rtcp_info,omitempty"`
+
+	// NACK tracking - 独立跟踪正在进行NACK的序列号
+	ActiveNACKs map[uint16]*NACKInfo `json:"active_nacks,omitempty"`
 }
 
-// SequenceWindow represents a sliding window for sequence number tracking
-type SequenceWindow struct {
-	BaseSeq      uint16    `json:"base_seq"`      // 窗口起始序列号
-	WindowSize   int       `json:"window_size"`   // 窗口大小（通常16-32）
-	ReceivedMask uint32    `json:"received_mask"` // 位掩码，1表示已接收
-	MaxSeq       uint16    `json:"max_seq"`       // 窗口内最大序列号
-	LastUpdate   time.Time `json:"last_update"`   // 最后更新时间
+// NACKInfo tracks NACK retry information for a specific sequence number
+type NACKInfo struct {
+	SequenceNumber uint16    `json:"sequence_number"`
+	FirstNACKTime  time.Time `json:"first_nack_time"`
+	LastNACKTime   time.Time `json:"last_nack_time"`
+	RetryCount     int       `json:"retry_count"`
+	MaxRetries     int       `json:"max_retries"`
+	GiveUpTime     time.Time `json:"give_up_time"` // 何时放弃这个NACK
+	// 是否已经收到
+	Received bool `json:"received"`
 }
 
 // StreamInfo contains network information for RTP or RTCP stream
