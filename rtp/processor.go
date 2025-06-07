@@ -31,6 +31,15 @@ type SessionKey struct {
 	Direction Direction `json:"direction"`
 }
 
+// PacketType represents the type of packet
+type PacketType int
+
+const (
+	PacketTypeOther PacketType = iota
+	PacketTypeRTP
+	PacketTypeRTCP
+)
+
 // Processor implements PacketProcessor interface
 type Processor struct {
 	config ProcessorConfig
@@ -121,284 +130,139 @@ func (p *Processor) SetPacketSender(sender PacketSender) {
 
 // ProcessPacket processes a UDP packet and returns whether it should be forwarded
 func (p *Processor) ProcessPacket(packet gopacket.Packet, isNearEnd bool) (shouldForward bool, err error) {
-	p.mutex.Lock()
-	p.stats.TotalUDPPackets++
-	p.mutex.Unlock()
-
-	// Extract UDP layer
 	udpLayer := packet.Layer(layers.LayerTypeUDP)
 	if udpLayer == nil {
 		return true, nil // Not UDP, forward normally
 	}
 
-	udp, _ := udpLayer.(*layers.UDP)
-	payload := udp.Payload
-
-	if len(payload) < 12 { // 12字节是rtp头， 一般数据是不会小于12的
-		return true, nil // Too short for RTP/RTCP
+	udp, ok := udpLayer.(*layers.UDP)
+	if !ok {
+		return true, nil
 	}
 
-	// Determine packet type
-	if p.isRTPPacket(payload) {
+	payload := udp.Payload
+
+	// Update UDP packet statistics (no lock for performance)
+	p.stats.TotalUDPPackets++
+
+	// Determine packet type once
+	packetType := p.checkPacketType(payload)
+
+	if packetType == PacketTypeRTP {
 		return p.processRTPPacket(packet, payload, isNearEnd)
-	} else if p.isRTCPPacket(payload) {
+	} else if packetType == PacketTypeRTCP {
 		return p.processRTCPPacket(packet, payload, isNearEnd)
 	}
 
-	// Not RTP/RTCP packet
-	p.mutex.Lock()
+	// Not RTP/RTCP, update statistics and forward normally (no lock for performance)
 	p.stats.TotalNonRTPPackets++
-	p.mutex.Unlock()
 
-	return true, nil // Forward non-RTP/RTCP packets normally
-}
-
-// isRTPPacket checks if payload is an RTP packet
-func (p *Processor) isRTPPacket(payload []byte) bool {
-	if len(payload) < 12 {
-		return false
-	}
-
-	// Check RTP version (should be 2)
-	version := (payload[0] >> 6) & 0x03
-	if version != 2 {
-		return false
-	}
-
-	// Check payload type (should be < 128 for RTP, >= 128 for RTCP)
-	payloadType := payload[1] & 0x7F
-	return payloadType < 128
-}
-
-// isRTCPPacket checks if payload is an RTCP packet
-func (p *Processor) isRTCPPacket(payload []byte) bool {
-	if len(payload) < 8 {
-		return false
-	}
-
-	// Check RTP version (should be 2)
-	version := (payload[0] >> 6) & 0x03
-	if version != 2 {
-		return false
-	}
-
-	// Check packet type (should be >= 128 for RTCP)
-	packetType := payload[1]
-	return packetType >= 128 && packetType <= 223
-}
-
-// processRTPPacket processes an RTP packet
-func (p *Processor) processRTPPacket(packet gopacket.Packet, payload []byte, isNearEnd bool) (bool, error) {
-	header, err := p.parseRTPHeader(payload)
-	if err != nil {
-		return true, err
-	}
-
-	// 过滤SSRC=0的包，这些通常是无效的RTP包
-	if header.SSRC == 0 {
-		return true, nil // 直接转发，不处理
-	}
-
-	p.mutex.Lock()
-	p.stats.TotalRTPPackets++
-	p.mutex.Unlock()
-
-	direction := DirectionNearToFar
-	if !isNearEnd {
-		direction = DirectionFarToNear
-	}
-
-	sessionKey := SessionKey{
-		SSRC:      header.SSRC,
-		Direction: direction,
-	}
-
-	// Update session info
-	seqdiff := p.updateSessionInfo(packet, sessionKey, header, true)
-
-	if isNearEnd {
-		return p.processNearEndRTP(packet, sessionKey, header)
-	} else {
-		return p.processFarEndRTP(packet, sessionKey, header, seqdiff)
-	}
-}
-
-// processRTCPPacket processes an RTCP packet
-func (p *Processor) processRTCPPacket(packet gopacket.Packet, payload []byte, isNearEnd bool) (bool, error) {
-	p.mutex.Lock()
-	p.stats.TotalRTCPPackets++
-	p.mutex.Unlock()
-
-	// Parse RTCP header to get SSRC
-	if len(payload) < 8 {
-		return true, fmt.Errorf("RTCP packet too short")
-	}
-
-	packetType := payload[1]
-
-	// 近端发的RTCP包：只透传并记录信息
-	if isNearEnd {
-		// 提取SSRC并记录会话信息
-		var ssrc uint32
-		if len(payload) >= 8 {
-			ssrc = binary.BigEndian.Uint32(payload[4:8])
-		}
-
-		// 过滤SSRC=0的包
-		if ssrc == 0 {
-			return true, nil // 直接转发，不处理
-		}
-
-		sessionKey := SessionKey{
-			SSRC:      ssrc,
-			Direction: DirectionNearToFar,
-		}
-
-		// 记录RTCP会话信息（IP、端口、MAC地址等）
-		p.updateSessionInfo(packet, sessionKey, RTPHeader{SSRC: ssrc}, false)
-
-		if p.config.Debug {
-			logf("Near-end RTCP: SSRC=%d, Type=%d, forwarding (transparent)", ssrc, packetType)
-		}
-
-		// 近端RTCP包直接透传
-		return true, nil
-	}
-
-	// 远端发的RTCP包：需要处理NACK等
-	// Handle NACK packets specially
-	if packetType == 205 { // RTCP NACK (RFC 4585)
-		return p.processNACKPacket(packet, payload, isNearEnd)
-	}
-
-	// For other RTCP packets from far-end, extract SSRC and update session info
-	var ssrc uint32
-	if len(payload) >= 8 {
-		ssrc = binary.BigEndian.Uint32(payload[4:8])
-	}
-
-	// 过滤SSRC=0的包
-	if ssrc == 0 {
-		return true, nil // 直接转发，不处理
-	}
-
-	sessionKey := SessionKey{
-		SSRC:      ssrc,
-		Direction: DirectionFarToNear,
-	}
-
-	// Update session info for RTCP
-	p.updateSessionInfo(packet, sessionKey, RTPHeader{SSRC: ssrc}, false)
-
-	if p.config.Debug {
-		logf("Far-end RTCP: SSRC=%d, Type=%d, forwarding", ssrc, packetType)
-	}
-
-	return true, nil // Forward RTCP packets normally
-}
-
-// processNearEndRTP processes RTP packet from near-end (if1 -> if2)
-func (p *Processor) processNearEndRTP(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader) (bool, error) {
-	// 近端包：缓存100-500ms，全部转发给远端
-	bufferedPacket := &BufferedPacket{
-		Data:      packet.Data(),
-		Header:    header,
-		Timestamp: time.Now(),
-		Interface: p.config.NearEndInterface,
-	}
-
-	p.mutex.Lock()
-	p.nearEndBuffer[sessionKey] = append(p.nearEndBuffer[sessionKey], bufferedPacket)
-	p.stats.NearEndStats.ReceivedPackets++
-	p.stats.NearEndStats.BufferedPackets++
-	p.stats.NearEndStats.ForwardedPackets++
-	// 如果p.nearEndBuffer[sessionKey]的长度大于1000，则清理老包
-	if len(p.nearEndBuffer[sessionKey]) > 1000 {
-		p.nearEndBuffer[sessionKey] = p.nearEndBuffer[sessionKey][:1000]
-	}
-	p.mutex.Unlock()
-
-	if p.config.Debug {
-		logf("Near-end RTP: SSRC=%d, Seq=%d, buffered and forwarding",
-			header.SSRC, header.SequenceNumber)
-	}
-
-	return true, nil // 近端包全部转发
-}
-
-// processFarEndRTP processes RTP packet from far-end (if2 -> if1)
-func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, seqdiff int) (bool, error) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	session := p.sessions[sessionKey]
-	if session == nil {
-		// 新会话，直接转发
-		p.stats.FarEndStats.ReceivedPackets++
-		p.stats.FarEndStats.ForwardedPackets++
-
-		if p.config.Debug {
-			logf("Far-end RTP: New session SSRC=%d, Seq=%d, forwarding",
-				header.SSRC, header.SequenceNumber)
-		}
-
-		return true, nil
-	}
-
-	p.stats.FarEndStats.ReceivedPackets++
-	currentSeq := header.SequenceNumber
-
-	// 检查并清理对应的NACK跟踪（包已收到）
-	if _, exists := session.ActiveNACKs[currentSeq]; exists {
-		delete(session.ActiveNACKs, currentSeq)
-		if p.config.Debug {
-			logf("Far-end RTP: SSRC=%d, Seq=%d, packet received, stopping NACK tracking",
-				header.SSRC, currentSeq)
-		}
-	}
-
-	// TODO: 用户将手动实现简单的丢包检测逻辑, seqdiff > 1 表示丢（乱序）了seqdiff-1个包
-	// 举例： 原先是 6， currentSeq=9， seqdiff=3，表示丢（乱序）了2个包：7，8
-	if seqdiff > 1 {
-		for i := 1; i < seqdiff; i++ {
-			nackinfo := &NACKInfo{
-				SequenceNumber: currentSeq - uint16(i),
-				FirstNACKTime:  time.Now(),
-				RetryCount:     0,
-				MaxRetries:     3,
-				GiveUpTime:     time.Now().Add(time.Second * 5),
-			}
-			session.ActiveNACKs[currentSeq-uint16(i)] = nackinfo
-			go p.scheduleNACK(session, nackinfo, sessionKey)
-		}
-	}
-
-	// 远端包直接转发给近端
-	p.stats.FarEndStats.ForwardedPackets++
-	if p.config.Debug {
-		logf("Far-end RTP: SSRC=%d, Seq=%d, forwarding directly to near-end",
-			header.SSRC, currentSeq)
-	}
 	return true, nil
 }
 
-// calculateSeqDiff calculates sequence number difference considering wrap-around
-// 返回值：正数表示current在expected之后，负数表示current在expected之前，0表示相等
-func (p *Processor) calculateSeqDiff(current, expected uint16) int {
-	// 直接计算差值
-	diff := int(current) - int(expected)
-
-	// 处理回绕情况
-	// 如果差值超过32767，说明发生了回绕
-	if diff > 32767 {
-		// current实际上在expected之前（回绕到小数值）
-		diff -= 65536
-	} else if diff < -32767 {
-		// current实际上在expected之后（回绕到大数值）
-		diff += 65536
+// checkPacketType determines if payload is RTP, RTCP, or other packet type
+func (p *Processor) checkPacketType(payload []byte) PacketType {
+	if len(payload) < 8 {
+		return PacketTypeOther
 	}
 
-	return diff
+	// Check RTP version (should be 2)
+	version := (payload[0] >> 6) & 0x03
+	if version != 2 {
+		return PacketTypeOther
+	}
+
+	// Get the packet type field
+	// 如果是rtcp的话  第二个byte都是pt
+	// 如果是rtp的话  第二个byte的后7个bit是pt
+	packetType := payload[1]
+	rtpPacketType := packetType & 0x7F
+
+	// RTP packets have payload type < 128
+	if rtpPacketType < 64 || rtpPacketType > 95 {
+		// Additional RTP validation: minimum 12 bytes for RTP header
+		if len(payload) < 12 {
+			return PacketTypeOther
+		}
+		return PacketTypeRTP
+	}
+
+	// RTCP packets have packet type >= 128 and <= 223
+	if packetType >= 128 && packetType <= 223 {
+		// 验证RTCP复合报文的长度字段
+		return p.validateRTCPCompound(payload)
+	}
+
+	return PacketTypeOther
+}
+
+// validateRTCPCompound validates RTCP compound packet structure
+func (p *Processor) validateRTCPCompound(payload []byte) PacketType {
+	offset := 0
+	totalLength := len(payload)
+
+	// 遍历所有可能的RTCP子报文
+	for offset < totalLength {
+		// 每个RTCP报文至少需要4字节（固定头部）
+		if offset+4 > totalLength {
+			if p.config.Debug {
+				logf("RTCP validation failed: insufficient bytes for header at offset %d", offset)
+			}
+			return PacketTypeOther
+		}
+
+		// 检查版本号
+		version := (payload[offset] >> 6) & 0x03
+		if version != 2 {
+			if p.config.Debug {
+				logf("RTCP validation failed: invalid version %d at offset %d", version, offset)
+			}
+			return PacketTypeOther
+		}
+
+		// 检查包类型
+		packetType := payload[offset+1]
+		if packetType < 128 || packetType > 223 {
+			if p.config.Debug {
+				logf("RTCP validation failed: invalid packet type %d at offset %d", packetType, offset)
+			}
+			return PacketTypeOther
+		}
+
+		// 获取长度字段（以32位字为单位，减1）
+		lengthField := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
+		packetBytes := (int(lengthField) + 1) * 4
+
+		// 检查长度是否合理
+		if packetBytes < 4 || packetBytes > 1500 {
+			if p.config.Debug {
+				logf("RTCP validation failed: invalid packet length %d at offset %d", packetBytes, offset)
+			}
+			return PacketTypeOther
+		}
+
+		// 检查是否超出总长度
+		if offset+packetBytes > totalLength {
+			if p.config.Debug {
+				logf("RTCP validation failed: packet length %d exceeds remaining bytes %d at offset %d",
+					packetBytes, totalLength-offset, offset)
+			}
+			return PacketTypeOther
+		}
+
+		// 移动到下一个子报文
+		offset += packetBytes
+	}
+
+	// 如果能完整解析所有子报文，且正好用完所有字节，则认为是有效的RTCP包
+	if offset == totalLength {
+		return PacketTypeRTCP
+	}
+
+	if p.config.Debug {
+		logf("RTCP validation failed: total length mismatch, parsed %d bytes, expected %d", offset, totalLength)
+	}
+	return PacketTypeOther
 }
 
 // isSeqInOrder 检查序列号是否在合理的顺序范围内
@@ -450,6 +314,9 @@ func (p *Processor) seqInRange(seq, start, end uint16) bool {
 // updateSessionInfo updates session information，
 // return seq diff = rtp: if from far-end, return seq diff, if from near-end, return 0
 func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, isRTP bool) int {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
 	now := time.Now()
 
 	session := p.sessions[sessionKey]
@@ -574,47 +441,6 @@ func (p *Processor) GetActiveNACKs() map[SessionKey]map[uint16]*NACKInfo {
 	return result
 }
 
-// GetNACKStats returns NACK statistics summary
-func (p *Processor) GetNACKStats() map[uint32]struct {
-	ActiveNACKCount int
-	OldestNACKAge   time.Duration
-	TotalRetries    int
-} {
-	p.mutex.RLock()
-	defer p.mutex.RUnlock()
-
-	result := make(map[uint32]struct {
-		ActiveNACKCount int
-		OldestNACKAge   time.Duration
-		TotalRetries    int
-	})
-
-	now := time.Now()
-
-	for sessionKey, session := range p.sessions {
-		if session.ActiveNACKs == nil {
-			continue
-		}
-
-		ssrc := sessionKey.SSRC
-		stats := result[ssrc]
-
-		for _, nackInfo := range session.ActiveNACKs {
-			stats.ActiveNACKCount++
-			stats.TotalRetries += nackInfo.RetryCount
-
-			age := now.Sub(nackInfo.FirstNACKTime)
-			if age > stats.OldestNACKAge {
-				stats.OldestNACKAge = age
-			}
-		}
-
-		result[ssrc] = stats
-	}
-
-	return result
-}
-
 // cleanupRoutine periodically cleans up expired sessions
 func (p *Processor) cleanupRoutine() {
 	for {
@@ -678,97 +504,40 @@ func (p *Processor) cleanupExpiredSessions() {
 	}
 }
 
-// processNACKPacket processes an incoming NACK packet
-func (p *Processor) processNACKPacket(packet gopacket.Packet, payload []byte, isNearEnd bool) (bool, error) {
-	if len(payload) < 16 {
-		return true, fmt.Errorf("NACK packet too short")
-	}
-
-	// Parse NACK packet
-	ssrc := binary.BigEndian.Uint32(payload[8:12])
-	pid := binary.BigEndian.Uint16(payload[12:14])
-	// blp := binary.BigEndian.Uint16(payload[14:16]) // For simplicity, ignore BLP
-
-	direction := DirectionFarToNear
-	if !isNearEnd {
-		direction = DirectionNearToFar
-	}
-
-	sessionKey := SessionKey{
-		SSRC:      ssrc,
-		Direction: direction,
-	}
-
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	if isNearEnd {
-		// NACK from near-end, resend from near-end buffer
-		p.stats.NearEndStats.NACKsReceived++
-		p.resendFromNearEndBuffer(sessionKey, pid)
-	} else {
-		// NACK from far-end, update stats
-		p.stats.FarEndStats.NACKsReceived++
-	}
-
-	if p.config.Debug {
-		logf("Processed NACK: SSRC=%d, PID=%d, isNearEnd=%t", ssrc, pid, isNearEnd)
-	}
-
-	return false, nil // Don't forward NACK packets
-}
-
 // resendFromNearEndBuffer resends packets from near-end buffer based on NACK
 func (p *Processor) resendFromNearEndBuffer(sessionKey SessionKey, requestedSeq uint16) {
+	p.mutex.RLock()
 	buffer := p.nearEndBuffer[sessionKey]
 	if len(buffer) == 0 {
+		p.mutex.RUnlock()
 		return
 	}
 
-	// Find and resend the requested packet
+	// Find the requested packet
+	var foundPacket *BufferedPacket
 	for _, bufferedPacket := range buffer {
 		if bufferedPacket.Header.SequenceNumber == requestedSeq {
-			if p.sender != nil {
-				targetInterface := p.config.FarEndInterface
-				if err := p.sender.SendPacket(bufferedPacket.Data, targetInterface); err != nil {
-					logf("Failed to resend packet: %v", err)
-				} else {
-					p.stats.NearEndStats.ForwardedPackets++
-					if p.config.Debug {
-						logf("Resent packet: SSRC=%d, Seq=%d",
-							bufferedPacket.Header.SSRC, bufferedPacket.Header.SequenceNumber)
-					}
-				}
-			}
+			foundPacket = bufferedPacket
 			break
 		}
 	}
-}
+	p.mutex.RUnlock()
 
-// isDuplicatePacket 检查是否是重复包
-func (p *Processor) isDuplicatePacket(sessionKey SessionKey, seq uint16) bool {
-	buffer := p.farEndBuffer[sessionKey]
-	for _, buffered := range buffer {
-		if buffered.Header.SequenceNumber == seq {
-			return true
+	// Send the packet if found
+	if foundPacket != nil && p.sender != nil {
+		targetInterface := p.config.FarEndInterface
+		if err := p.sender.SendPacket(foundPacket.Data, targetInterface); err != nil {
+			logf("Failed to resend packet: %v", err)
+		} else {
+			// Update statistics (no lock for performance)
+			p.stats.NearEndStats.ForwardedPackets++
+
+			if p.config.Debug {
+				logf("Resent packet: SSRC=%d, Seq=%d",
+					foundPacket.Header.SSRC, foundPacket.Header.SequenceNumber)
+			}
 		}
 	}
-	return false
-}
-
-// canFillGap 检查包是否能填补空隙 (deprecated - use sequence window)
-func (p *Processor) canFillGap(sessionKey SessionKey, seq uint16) bool {
-	// This function is deprecated and replaced by sequence window logic
-	return false
-}
-
-// forwardConsecutiveBufferedPackets 转发缓存中连续的包 (deprecated - use forwardConsecutiveBufferedPacketsWithWindow)
-func (p *Processor) forwardConsecutiveBufferedPackets(sessionKey SessionKey) {
-	// This function is deprecated, use forwardConsecutiveBufferedPacketsWithWindow instead
-	if p.config.Debug {
-		logf("forwardConsecutiveBufferedPackets called (deprecated) for SSRC=%d", sessionKey.SSRC)
-	}
-	p.forwardConsecutiveBufferedPacketsWithWindow(sessionKey)
 }
 
 // testSequenceHandling 测试序列号处理逻辑（用于调试和验证）
@@ -906,44 +675,4 @@ func (p *Processor) parseRTPHeader(payload []byte) (RTPHeader, error) {
 	}
 
 	return header, nil
-}
-
-// forwardConsecutiveBufferedPacketsWithWindow 转发缓存中的包（简化版）
-func (p *Processor) forwardConsecutiveBufferedPacketsWithWindow(sessionKey SessionKey) {
-	session := p.sessions[sessionKey]
-	if session == nil {
-		return
-	}
-
-	buffer := p.farEndBuffer[sessionKey]
-	if len(buffer) == 0 {
-		return
-	}
-
-	// 简化逻辑：直接转发所有缓存包
-	forwardedCount := 0
-	for _, bufferedPacket := range buffer {
-		if p.sender != nil {
-			targetInterface := p.config.NearEndInterface
-			if err := p.sender.SendPacket(bufferedPacket.Data, targetInterface); err != nil {
-				logf("Failed to send buffered packet: %v", err)
-				p.stats.FarEndStats.DroppedPackets++
-			} else {
-				p.stats.FarEndStats.ForwardedPackets++
-				forwardedCount++
-				if p.config.Debug {
-					logf("Forwarded buffered packet: SSRC=%d, Seq=%d",
-						bufferedPacket.Header.SSRC, bufferedPacket.Header.SequenceNumber)
-				}
-			}
-		}
-	}
-
-	// 清空缓存
-	p.farEndBuffer[sessionKey] = nil
-
-	if forwardedCount > 0 && p.config.Debug {
-		logf("Forwarded %d buffered packets for SSRC=%d",
-			forwardedCount, sessionKey.SSRC)
-	}
 }

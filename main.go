@@ -4,8 +4,6 @@ import (
 	"flag"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"turborelay/net"
@@ -58,7 +56,7 @@ func main() {
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	//signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	log.Printf("TurboRelay is running... Press Ctrl+C to stop")
 

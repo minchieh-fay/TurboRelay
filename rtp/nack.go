@@ -11,12 +11,19 @@ import (
 
 // scheduleNACK schedules a NACK request for missing packets (deprecated - use scheduleNACKForMissing)
 func (p *Processor) scheduleNACK(session *SessionInfo, nackinfo *NACKInfo, sessionKey SessionKey) {
+
 	expectedSeq := nackinfo.SequenceNumber
+	if p.config.Debug {
+		logf("1--------------------------------%d", expectedSeq)
+	}
 	// sleep 10ms
 	time.Sleep(time.Millisecond * 10)
 
 	// 检查session.ActiveNACKs， 如果不存在， 说明这个包已经来过了，可以不用处理了
 	if nackinfo.Received {
+		if p.config.Debug {
+			logf("2--------------------------------%d", expectedSeq)
+		}
 		return
 	}
 
@@ -30,12 +37,21 @@ func (p *Processor) scheduleNACK(session *SessionInfo, nackinfo *NACKInfo, sessi
 	// 一边判断nackinfo.Received， 一边发送NACK， 执行5次， 每次间隔50ms
 	for i := 0; i < 5; i++ {
 		if nackinfo.Received {
+			if p.config.Debug {
+				logf("3--------------------------------%d", expectedSeq)
+			}
 			return
+		}
+		if p.config.Debug {
+			logf("4--------------------------------%d", expectedSeq)
 		}
 		p.sendNACKForSequence(sessionKey, expectedSeq)
 		time.Sleep(time.Millisecond * 50)
 	}
 
+	if p.config.Debug {
+		logf("5--------------------------------%d", expectedSeq)
+	}
 	time.Sleep(time.Millisecond * 250)
 	// 不管有没有来  清理nackinfo
 	p.mutex.Lock()
@@ -65,6 +81,7 @@ func (p *Processor) sendNACKForSequence(sessionKey SessionKey, missingSeq uint16
 	if err := p.sender.SendPacket(nackPacket, targetInterface); err != nil {
 		logf("Failed to send NACK: %v", err)
 	} else {
+		// Update statistics (no lock for performance)
 		p.stats.FarEndStats.NACKsSent++
 		if p.config.Debug {
 			logf("Sent NACK for SSRC=%d, missing seq %d", sessionKey.SSRC, missingSeq)
