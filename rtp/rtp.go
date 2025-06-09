@@ -49,9 +49,9 @@ func (p *Processor) processNearEndRTP(packet gopacket.Packet, sessionKey Session
 
 	p.mutex.Lock()
 	p.nearEndBuffer[sessionKey] = append(p.nearEndBuffer[sessionKey], bufferedPacket)
-	// 如果p.nearEndBuffer[sessionKey]的长度大于1000，则清理老包
+	// 如果p.nearEndBuffer[sessionKey]的长度大于1000，则删除老包，保留新包
 	if len(p.nearEndBuffer[sessionKey]) > 1000 {
-		p.nearEndBuffer[sessionKey] = p.nearEndBuffer[sessionKey][:1000]
+		p.nearEndBuffer[sessionKey] = p.nearEndBuffer[sessionKey][len(p.nearEndBuffer[sessionKey])-1000:]
 	}
 	p.mutex.Unlock()
 
@@ -74,13 +74,13 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 	session := p.sessions[sessionKey]
 	if session == nil {
 		p.mutex.Unlock()
-		// 新会话，直接转发
+		// 新会话：初始化序列号窗口后再转发
 		// Update statistics (no lock for performance)
 		p.stats.FarEndStats.ReceivedPackets++
 		p.stats.FarEndStats.ForwardedPackets++
 
 		if p.config.Debug {
-			logf("Far-end RTP: New session SSRC=%d, Seq=%d, forwarding",
+			logf("Far-end RTP: New session SSRC=%d, Seq=%d, initialized and forwarding",
 				header.SSRC, header.SequenceNumber)
 		}
 
@@ -98,7 +98,7 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 		}
 	}
 
-	// TODO: 用户将手动实现简单的丢包检测逻辑, seqdiff > 1 表示丢（乱序）了seqdiff-1个包
+	// 丢包检测：seqdiff > 1 表示丢（乱序）了seqdiff-1个包
 	// 举例： 原先是 6， currentSeq=9， seqdiff=3，表示丢（乱序）了2个包：7，8
 	if seqdiff > 1 {
 		for i := 1; i < seqdiff; i++ {
@@ -112,15 +112,24 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 				// 计算方法：65536 - (i - currentSeq) = 65536 - i + currentSeq
 				seq = 65535 - uint16(i) + currentSeq + 1
 			}
-			nackinfo := &NACKInfo{
-				SequenceNumber: seq,
-				FirstNACKTime:  time.Now(),
-				RetryCount:     0,
-				MaxRetries:     3,
-				GiveUpTime:     time.Now().Add(time.Second * 5),
+
+			// 避免重复的NACK请求
+			if _, exists := session.ActiveNACKs[seq]; !exists {
+				nackinfo := &NACKInfo{
+					SequenceNumber: seq,
+					FirstNACKTime:  time.Now(),
+					RetryCount:     0,
+					MaxRetries:     3,
+					GiveUpTime:     time.Now().Add(time.Second * 5),
+				}
+				session.ActiveNACKs[seq] = nackinfo
+				go p.scheduleNACK(session, nackinfo, sessionKey)
+
+				if p.config.Debug {
+					logf("Far-end RTP: SSRC=%d, detected missing packet Seq=%d, triggering NACK",
+						header.SSRC, seq)
+				}
 			}
-			session.ActiveNACKs[seq] = nackinfo
-			go p.scheduleNACK(session, nackinfo, sessionKey)
 		}
 	}
 	p.mutex.Unlock()

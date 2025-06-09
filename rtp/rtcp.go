@@ -40,12 +40,6 @@ func (p *Processor) processRTCPPacket(packet gopacket.Packet, payload []byte, is
 
 // recordRTCPSessionInfo records session information from RTCP packets
 func (p *Processor) recordRTCPSessionInfo(packet gopacket.Packet, payload []byte, direction Direction) {
-	// 只需要提取第一个RTCP子报文的SSRC即可
-	// 一般RTCP复合包中所有子报文都是同一个SSRC
-	if len(payload) < 8 {
-		return
-	}
-
 	// 提取第一个子报文的SSRC
 	ssrc := binary.BigEndian.Uint32(payload[4:8])
 	if ssrc == 0 {
