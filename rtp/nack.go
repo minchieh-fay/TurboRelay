@@ -110,16 +110,16 @@ func (p *Processor) buildNACKPacket(ssrc uint32, startSeq, endSeq uint16, sessio
 				srcIP, sourcePort, dstIP, destPort)
 		}
 	} else if session.RTPInfo != nil {
-		// 如果没有RTCP会话信息，直接使用RTP端口发送NACK包
-		destPort = session.RTPInfo.SourcePort // 直接使用RTP端口
-		sourcePort = session.RTPInfo.DestPort
+		// 如果没有RTCP会话信息，根据RTP端口推算RTCP端口（RTP端口+1）
+		destPort = session.RTPInfo.SourcePort + 1 // RTCP端口 = RTP端口 + 1
+		sourcePort = session.RTPInfo.DestPort + 1
 		srcIP = session.RTPInfo.DestIP
 		dstIP = session.RTPInfo.SourceIP
 		srcMAC = session.RTPInfo.DestMAC
 		dstMAC = session.RTPInfo.SourceMAC
 
 		if p.config.Debug {
-			logf("Using RTP session info for NACK (same port): %s:%d -> %s:%d",
+			logf("Using RTP session info for NACK (RTCP port +1): %s:%d -> %s:%d",
 				srcIP, sourcePort, dstIP, destPort)
 		}
 	} else {
