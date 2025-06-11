@@ -313,7 +313,7 @@ func (p *Processor) seqInRange(seq, start, end uint16) bool {
 
 // updateSessionInfo updates session information，
 // return seq diff = rtp: if from far-end, return seq diff, if from near-end, return 0
-func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, isRTP bool) int {
+func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey SessionKey, header RTPHeader, isRTP bool) (int, float64) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
@@ -324,7 +324,9 @@ func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey Session
 		session = &SessionInfo{
 			SSRC:        header.SSRC,
 			LastSeen:    now,
+			FirstSeen:   now,
 			MaxSeq:      header.SequenceNumber,
+			PacketCount: 0,
 			ActiveNACKs: make(map[uint16]*NACKInfo), // 初始化NACK跟踪
 		}
 
@@ -335,6 +337,19 @@ func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey Session
 	}
 
 	session.LastSeen = now
+	session.PacketCount++
+
+	// 定义一个变量代表包的速度
+	packetSpeed := 10.0
+	// 计算firstseen到now的时间差
+	duration := now.Sub(session.FirstSeen)
+	if duration > time.Second*2 {
+		packetSpeed = float64(session.PacketCount) / duration.Seconds()
+		if duration > time.Second*4 {
+			session.FirstSeen = session.FirstSeen.Add(time.Second * 2)
+			session.PacketCount = session.PacketCount / 3
+		}
+	}
 
 	// Extract network information
 	streamInfo := p.extractStreamInfo(packet)
@@ -346,13 +361,13 @@ func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey Session
 			seqdiff := p.calculateSeqDiff(header.SequenceNumber, session.MaxSeq)
 			if seqdiff > 0 {
 				session.MaxSeq = header.SequenceNumber
-				return seqdiff
+				return seqdiff, packetSpeed
 			}
 		}
 	} else {
 		session.RTCPInfo = streamInfo
 	}
-	return 0
+	return 0, packetSpeed
 }
 
 // extractStreamInfo extracts network information from packet

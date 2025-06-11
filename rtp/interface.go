@@ -71,8 +71,11 @@ type EndpointStats struct {
 
 // SessionInfo contains information about an RTP session
 type SessionInfo struct {
-	SSRC     uint32    `json:"ssrc"`
-	LastSeen time.Time `json:"last_seen"`
+	SSRC      uint32    `json:"ssrc"`
+	LastSeen  time.Time `json:"last_seen"`
+	FirstSeen time.Time `json:"first_seen"`
+
+	PacketCount uint64 `json:"packet_count"`
 
 	// Sequence tracking
 	MaxSeq uint16 `json:"max_seq"`

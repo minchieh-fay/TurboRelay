@@ -27,7 +27,10 @@ func (p *Processor) processRTPPacket(packet gopacket.Packet, payload []byte, isN
 	}
 
 	// Update session info
-	seqdiff := p.updateSessionInfo(packet, sessionKey, header, true)
+	seqdiff, packetSpeed := p.updateSessionInfo(packet, sessionKey, header, true)
+	if packetSpeed < 5 { // 速度不够快 大概率不是rtp包 （发生了误判）
+		return true, nil
+	}
 
 	if isNearEnd {
 		go p.processNearEndRTP(packet, sessionKey, header)
@@ -90,7 +93,8 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 	currentSeq := header.SequenceNumber
 
 	// 检查并清理对应的NACK跟踪（包已收到）
-	if _, exists := session.ActiveNACKs[currentSeq]; exists {
+	if an, exists := session.ActiveNACKs[currentSeq]; exists {
+		an.Received = true
 		delete(session.ActiveNACKs, currentSeq)
 		if p.config.Debug {
 			logf("Far-end RTP: SSRC=%d, Seq=%d, packet received, stopping NACK tracking",
@@ -100,7 +104,7 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 
 	// 丢包检测：seqdiff > 1 表示丢（乱序）了seqdiff-1个包
 	// 举例： 原先是 6， currentSeq=9， seqdiff=3，表示丢（乱序）了2个包：7，8
-	if seqdiff > 1 {
+	if seqdiff > 1 && seqdiff < 30 {
 		for i := 1; i < seqdiff; i++ {
 			var seq uint16
 			// 正确处理uint16下溢回绕
