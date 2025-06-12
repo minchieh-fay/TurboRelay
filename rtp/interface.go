@@ -86,6 +86,9 @@ type SessionInfo struct {
 
 	// NACK tracking - 独立跟踪正在进行NACK的序列号
 	ActiveNACKs map[uint16]*NACKInfo `json:"active_nacks,omitempty"`
+
+	// 远端过来的rtp包的缓存器 排序器
+	FarRTPPackeManger *FarRTPPackeManger `json:"far_rtp_pack_manger,omitempty"`
 }
 
 // NACKInfo tracks NACK retry information for a specific sequence number

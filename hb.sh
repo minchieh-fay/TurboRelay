@@ -1,0 +1,1 @@
+scp -P 10810 turbo_relay root@10.35.147.52:/root/

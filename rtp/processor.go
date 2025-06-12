@@ -322,12 +322,13 @@ func (p *Processor) updateSessionInfo(packet gopacket.Packet, sessionKey Session
 	session := p.sessions[sessionKey]
 	if session == nil {
 		session = &SessionInfo{
-			SSRC:        header.SSRC,
-			LastSeen:    now,
-			FirstSeen:   now,
-			MaxSeq:      header.SequenceNumber,
-			PacketCount: 0,
-			ActiveNACKs: make(map[uint16]*NACKInfo), // 初始化NACK跟踪
+			SSRC:              header.SSRC,
+			LastSeen:          now,
+			FirstSeen:         now,
+			MaxSeq:            header.SequenceNumber,
+			PacketCount:       0,
+			ActiveNACKs:       make(map[uint16]*NACKInfo), // 初始化NACK跟踪
+			FarRTPPackeManger: NewFarRTPPackeManger(header.SequenceNumber),
 		}
 
 		p.sessions[sessionKey] = session

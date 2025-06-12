@@ -147,5 +147,23 @@ func (p *Processor) processFarEndRTP(packet gopacket.Packet, sessionKey SessionK
 		logf("Far-end RTP: SSRC=%d, Seq=%d, forwarding directly to near-end",
 			header.SSRC, currentSeq)
 	}
-	return true, nil
+	// 远端过来的rtp包的缓存器 排序器， 返回一个有序的包， 主动发送
+	pkts := session.FarRTPPackeManger.AddPacket(packet, header)
+	for _, pkt := range pkts {
+		// 发送重排序后的包到近端接口
+		if p.sender != nil {
+			targetInterface := p.config.NearEndInterface
+			if err := p.sender.SendPacket(pkt.Data(), targetInterface); err != nil {
+				logf("Failed to send reordered packet: %v", err)
+			} else {
+				// Update statistics (no lock for performance)
+				p.stats.FarEndStats.ForwardedPackets++
+				if p.config.Debug {
+					logf("Sent reordered packet: SSRC=%d, Seq=%d",
+						header.SSRC, header.SequenceNumber)
+				}
+			}
+		}
+	}
+	return false, nil
 }
