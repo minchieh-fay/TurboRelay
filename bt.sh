@@ -75,7 +75,11 @@ echo ""
 
 
 
-
+# 判断/Volumes/ff是否存在
+if [ -d "/Volumes/ff" ]; then
+    cp $BINARY_NAME /Volumes/ff/
+    ls -l /Volumes/ff  | grep $BINARY_NAME
+fi
 
 
 

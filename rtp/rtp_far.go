@@ -54,7 +54,7 @@ func (m *FarRTPPackeManger) AddPacket(packet gopacket.Packet, header RTPHeader) 
 		// 先将当前包 存入map
 		m.packets[header.SequenceNumber] = packet
 		// 如果expect等待了300ms，递增expectedSeq，取一个存在的发出去
-		if time.Since(m.lastSeqChangeTime) > 300*time.Millisecond { // 300ms 后，递增expectedSeq，取一个存在的发出去
+		if time.Since(m.lastSeqChangeTime) > 400*time.Millisecond { // 300ms 后，递增expectedSeq，取一个存在的发出去
 			m.lastSeqChangeTime = time.Now()
 
 			// 寻找下一个可用的包

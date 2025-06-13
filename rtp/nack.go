@@ -35,7 +35,7 @@ func (p *Processor) scheduleNACK(session *SessionInfo, nackinfo *NACKInfo, sessi
 	// 创建新的NACK跟踪信息
 
 	// 一边判断nackinfo.Received， 一边发送NACK， 执行5次， 每次间隔50ms
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 10; i++ {
 		if nackinfo.Received {
 			if p.config.Debug {
 				logf("3--------------------------------%d", expectedSeq)
@@ -46,7 +46,7 @@ func (p *Processor) scheduleNACK(session *SessionInfo, nackinfo *NACKInfo, sessi
 			logf("4--------------------------------%d", expectedSeq)
 		}
 		p.sendNACKForSequence(sessionKey, expectedSeq)
-		time.Sleep(time.Millisecond * 50)
+		time.Sleep(time.Millisecond * 20)
 	}
 
 	if p.config.Debug {

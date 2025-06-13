@@ -106,20 +106,24 @@ func (f *Forwarder) Start() error {
 
 	// Open first network interface
 	log.Printf("Opening interface %s...", f.interface1)
-	f.handle1, err = pcap.OpenLive(f.interface1, 1600, true, pcap.BlockForever)
+	// 使用9000字节snaplen，平衡性能和功能
+	// 支持Jumbo Frame，但避免过大的内存开销
+	const snaplen = 9000
+	f.handle1, err = pcap.OpenLive(f.interface1, snaplen, true, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("failed to open interface %s: %v", f.interface1, err)
 	}
-	log.Printf("Successfully opened interface %s (promiscuous mode enabled)", f.interface1)
+	log.Printf("Successfully opened interface %s (promiscuous mode enabled, snaplen: %d)", f.interface1, snaplen)
 
 	// Open second network interface
 	log.Printf("Opening interface %s...", f.interface2)
-	f.handle2, err = pcap.OpenLive(f.interface2, 1600, true, pcap.BlockForever)
+	// 使用9000字节snaplen，平衡性能和功能
+	f.handle2, err = pcap.OpenLive(f.interface2, snaplen, true, pcap.BlockForever)
 	if err != nil {
 		f.handle1.Close()
 		return fmt.Errorf("failed to open interface %s: %v", f.interface2, err)
 	}
-	log.Printf("Successfully opened interface %s (promiscuous mode enabled)", f.interface2)
+	log.Printf("Successfully opened interface %s (promiscuous mode enabled, snaplen: %d)", f.interface2, snaplen)
 
 	// Set BPF filter: capture IP packets and ARP packets
 	filter := "ip or arp"
@@ -244,14 +248,17 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 
 		// RTP处理：在writePacket之前劫持UDP包
 		shouldForward := true
+		var processedData []byte = data // 默认使用原始数据
+
+		// 协议特定处理
 		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-			// 这是UDP包，让RTP处理器分析
+			// UDP包处理 - RTP协议处理
 			isNearEnd := (srcInterface == f.interface1) // if1固定为近端
 
 			processed, err := f.rtpManager.ProcessPacket(packet, isNearEnd)
 			if err != nil {
 				if f.debug {
-					log.Printf("RTP processing error: %v", err)
+					log.Printf("UDP/RTP processing error: %v", err)
 				}
 				// 出错时仍然转发包
 			} else {
@@ -260,20 +267,62 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 					log.Printf("RTP processor decided not to forward UDP packet")
 				}
 			}
+
+			// UDP包的大小检查
+			if len(data) > 1500 && f.debug {
+				udp, _ := udpLayer.(*layers.UDP)
+				log.Printf("Large UDP packet: %d bytes, src:%d, dst:%d",
+					len(data), udp.SrcPort, udp.DstPort)
+			}
+
+		} else if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			// TCP包处理 - 分析TCP层数据
+			tcp, _ := tcpLayer.(*layers.TCP)
+
+			// 分析TCP包是否需要处理
+			needsProcessing, err := f.analyzeTCPPacket(packet, data)
+			if err != nil {
+				if f.debug {
+					log.Printf("TCP analysis error: %v", err)
+				}
+			} else if needsProcessing {
+				log.Printf("TCP packet needs processing: %d bytes, src:%d, dst:%d, seq:%d, flags:%s, payload:%d",
+					len(data), tcp.SrcPort, tcp.DstPort, tcp.Seq, f.getTCPFlags(tcp), len(tcp.Payload))
+
+				// 处理TCP包（可能是分割、分离粘包等）
+				if err := f.processTCPPacket(dstHandle, packet, data); err != nil {
+					log.Printf("TCP processing failed: %v", err)
+					// 处理失败，仍然尝试发送原包
+				} else {
+					// 处理成功，设置不转发原包
+					shouldForward = false
+					// 更新成功计数（因为我们已经发送了处理后的包）
+					stats.SuccessCount++
+				}
+			} else if f.debug {
+				log.Printf("Normal TCP packet: %d bytes, src:%d, dst:%d, seq:%d, flags:%s, payload:%d",
+					len(data), tcp.SrcPort, tcp.DstPort, tcp.Seq, f.getTCPFlags(tcp), len(tcp.Payload))
+			}
+
+		} else {
+			// 其他协议包（ICMP、ARP等）
+			if f.debug && len(data) > 1500 {
+				log.Printf("Large non-TCP/UDP packet: %d bytes", len(data))
+			}
 		}
 
-		// 如果RTP处理器决定不转发，跳过此包
+		// 如果协议处理器决定不转发，跳过此包
 		if !shouldForward {
 			continue
 		}
 
-		// Forward packet
-		if err := f.writePacket(dstHandle, data); err != nil {
-			f.mutex.Lock()
+		// Forward packet - 使用处理后的数据
+		if err := f.writePacket(dstHandle, processedData); err != nil {
 			stats.ErrorCount++
-			f.mutex.Unlock()
 
-			log.Printf("Failed to forward packet %s -> %s (%s): %v", srcInterface, dstInterface, endType, err)
+			// 记录转发失败的详细信息
+			log.Printf("Failed to forward packet %s -> %s (%s): %d bytes, error: %v",
+				srcInterface, dstInterface, endType, len(processedData), err)
 
 			// 对于远端连接，丢包是预期的，不需要过多报错
 			if !isNearEnd && stats.ErrorCount%100 == 1 {
@@ -282,9 +331,7 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 			continue
 		}
 
-		f.mutex.Lock()
 		stats.SuccessCount++
-		f.mutex.Unlock()
 
 		// Log packet info - show all ICMP and ARP packets, and every 50th packet for others
 		if 1 == 2 { // 暂时不打印
@@ -311,7 +358,14 @@ func (f *Forwarder) forwardPackets(srcHandle, dstHandle *pcap.Handle, srcInterfa
 
 // writePacket writes packet data
 func (f *Forwarder) writePacket(handle *pcap.Handle, data []byte) error {
-	return handle.WritePacketData(data)
+	// 直接发送数据包
+	err := handle.WritePacketData(data)
+
+	if err != nil && f.debug {
+		log.Printf("Failed to send packet (%d bytes): %v", len(data), err)
+	}
+
+	return err
 }
 
 // logPacketInfo logs packet information
@@ -431,4 +485,390 @@ func (f *Forwarder) SetDebugMode(enabled bool) {
 	defer f.mutex.Unlock()
 	f.debug = enabled
 	log.Printf("Debug mode %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
+}
+
+// getTCPFlags returns a string representation of TCP flags
+func (f *Forwarder) getTCPFlags(tcp *layers.TCP) string {
+	flags := ""
+	if tcp.FIN {
+		flags += "FIN "
+	}
+	if tcp.SYN {
+		flags += "SYN "
+	}
+	if tcp.RST {
+		flags += "RST "
+	}
+	if tcp.PSH {
+		flags += "PSH "
+	}
+	if tcp.ACK {
+		flags += "ACK "
+	}
+	if tcp.URG {
+		flags += "URG "
+	}
+	return flags
+}
+
+// handleTCPSegmentation handles TCP segmentation
+func (f *Forwarder) handleTCPSegmentation(dstHandle *pcap.Handle, packet gopacket.Packet, data []byte) error {
+	// 解析包结构
+	packet = gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
+
+	// 检查是否是TCP包
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		// 不是TCP包，使用简单截断
+		log.Printf("Non-TCP large packet, using truncation")
+		return f.writePacketTruncated(dstHandle, data)
+	}
+
+	tcp, _ := tcpLayer.(*layers.TCP)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		log.Printf("No IPv4 layer found, using truncation")
+		return f.writePacketTruncated(dstHandle, data)
+	}
+
+	ip, _ := ipLayer.(*layers.IPv4)
+	ethLayer := packet.Layer(layers.LayerTypeEthernet)
+	if ethLayer == nil {
+		log.Printf("No Ethernet layer found, using truncation")
+		return f.writePacketTruncated(dstHandle, data)
+	}
+
+	eth, _ := ethLayer.(*layers.Ethernet)
+
+	// 获取TCP payload
+	tcpPayload := tcp.Payload
+	if len(tcpPayload) == 0 {
+		// 没有TCP数据，直接发送
+		return dstHandle.WritePacketData(data)
+	}
+
+	log.Printf("TCP segmentation: Original packet %d bytes, TCP payload %d bytes, Seq=%d",
+		len(data), len(tcpPayload), tcp.Seq)
+
+	// 计算每个段的最大数据大小
+	// 以太网头(14) + IP头(20) + TCP头(20) = 54字节开销
+	const maxMTU = 1500
+	const headerOverhead = 14 + 20 + 20 // 以太网 + IP + TCP基本头部
+	maxSegmentData := maxMTU - headerOverhead
+
+	// 如果TCP payload小于等于最大段大小，直接截断发送
+	if len(tcpPayload) <= maxSegmentData {
+		return f.writePacketTruncated(dstHandle, data)
+	}
+
+	// 分割TCP payload
+	currentSeq := tcp.Seq
+	sentSegments := 0
+
+	for i := 0; i < len(tcpPayload); i += maxSegmentData {
+		end := i + maxSegmentData
+		if end > len(tcpPayload) {
+			end = len(tcpPayload)
+		}
+
+		segmentData := tcpPayload[i:end]
+
+		// 创建新的TCP段
+		newTCP := &layers.TCP{
+			SrcPort:    tcp.SrcPort,
+			DstPort:    tcp.DstPort,
+			Seq:        currentSeq,
+			Ack:        tcp.Ack,
+			DataOffset: 5, // 20字节TCP头部
+			Window:     tcp.Window,
+			Checksum:   0, // 将重新计算
+			Urgent:     0,
+		}
+
+		// 复制TCP标志，但对于中间段清除某些标志
+		newTCP.FIN = tcp.FIN && (end == len(tcpPayload)) // 只有最后一段保留FIN
+		newTCP.SYN = tcp.SYN && (i == 0)                 // 只有第一段保留SYN
+		newTCP.RST = tcp.RST
+		newTCP.PSH = tcp.PSH && (end == len(tcpPayload)) // 只有最后一段保留PSH
+		newTCP.ACK = tcp.ACK
+		newTCP.URG = tcp.URG && (i == 0) // 只有第一段保留URG
+
+		// 创建新的IP头
+		newIP := &layers.IPv4{
+			Version:    ip.Version,
+			IHL:        ip.IHL,
+			TOS:        ip.TOS,
+			Length:     uint16(20 + 20 + len(segmentData)), // IP头 + TCP头 + 数据
+			Id:         ip.Id + uint16(sentSegments),       // 递增IP ID
+			Flags:      ip.Flags,
+			FragOffset: ip.FragOffset,
+			TTL:        ip.TTL,
+			Protocol:   ip.Protocol,
+			Checksum:   0, // 将重新计算
+			SrcIP:      ip.SrcIP,
+			DstIP:      ip.DstIP,
+		}
+
+		// 创建新的以太网头
+		newEth := &layers.Ethernet{
+			SrcMAC:       eth.SrcMAC,
+			DstMAC:       eth.DstMAC,
+			EthernetType: eth.EthernetType,
+		}
+
+		// 设置校验和计算选项
+		newTCP.SetNetworkLayerForChecksum(newIP)
+
+		// 构建新包
+		buffer := gopacket.NewSerializeBuffer()
+		opts := gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		}
+
+		err := gopacket.SerializeLayers(buffer, opts,
+			newEth,
+			newIP,
+			newTCP,
+			gopacket.Payload(segmentData),
+		)
+
+		if err != nil {
+			log.Printf("Failed to serialize TCP segment %d: %v", sentSegments, err)
+			return err
+		}
+
+		// 发送段
+		segmentBytes := buffer.Bytes()
+		if err := dstHandle.WritePacketData(segmentBytes); err != nil {
+			log.Printf("Failed to send TCP segment %d (%d bytes, seq=%d): %v",
+				sentSegments, len(segmentBytes), currentSeq, err)
+			return err
+		}
+
+		log.Printf("Sent TCP segment %d: %d bytes, seq=%d, data_len=%d",
+			sentSegments, len(segmentBytes), currentSeq, len(segmentData))
+
+		// 更新序列号和计数器
+		currentSeq += uint32(len(segmentData))
+		sentSegments++
+	}
+
+	log.Printf("TCP segmentation completed: sent %d segments", sentSegments)
+	return nil
+}
+
+// writePacketTruncated 截断大包到MTU大小
+func (f *Forwarder) writePacketTruncated(handle *pcap.Handle, data []byte) error {
+	// 对于超大包，我们截断到安全的MTU大小
+	// 这不是理想的解决方案，但可以避免完全丢包
+	const maxMTU = 1500
+
+	if len(data) <= maxMTU {
+		return handle.WritePacketData(data)
+	}
+
+	// 截断到MTU大小
+	truncated := data[:maxMTU]
+
+	log.Printf("Truncating oversized packet from %d to %d bytes", len(data), len(truncated))
+
+	err := handle.WritePacketData(truncated)
+	if err != nil {
+		log.Printf("Even truncated packet failed: %v", err)
+	}
+
+	return err
+}
+
+// analyzeTCPPacket analyzes a TCP packet to determine if it needs processing
+func (f *Forwarder) analyzeTCPPacket(packet gopacket.Packet, data []byte) (bool, error) {
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		return false, fmt.Errorf("no TCP layer found")
+	}
+
+	tcp, _ := tcpLayer.(*layers.TCP)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return false, fmt.Errorf("no IPv4 layer found")
+	}
+
+	ip, _ := ipLayer.(*layers.IPv4)
+
+	// 检查包的总长度
+	totalLen := len(data)
+	tcpPayloadLen := len(tcp.Payload)
+
+	// 计算TCP序列号范围
+	currentSeq := tcp.Seq
+	nextSeq := currentSeq + uint32(tcpPayloadLen)
+
+	if f.debug {
+		log.Printf("TCP analysis: total=%d, tcp_payload=%d, seq=%d, next_seq=%d, ip_len=%d",
+			totalLen, tcpPayloadLen, currentSeq, nextSeq, ip.Length)
+	}
+
+	// 主要检查：包是否太大无法发送
+	if totalLen > 1500 {
+		log.Printf("Large TCP packet detected: %d bytes, seq=%d, next_seq=%d, payload=%d",
+			totalLen, currentSeq, nextSeq, tcpPayloadLen)
+		return true, nil
+	}
+
+	// 其他情况暂时不处理，保持原包完整性
+	return false, nil
+}
+
+// processTCPPacket processes a TCP packet while maintaining sequence number integrity
+func (f *Forwarder) processTCPPacket(dstHandle *pcap.Handle, packet gopacket.Packet, data []byte) error {
+	// 解析包结构
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		return fmt.Errorf("no TCP layer found")
+	}
+
+	tcp, _ := tcpLayer.(*layers.TCP)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return fmt.Errorf("no IPv4 layer found")
+	}
+
+	ip, _ := ipLayer.(*layers.IPv4)
+	ethLayer := packet.Layer(layers.LayerTypeEthernet)
+	if ethLayer == nil {
+		return fmt.Errorf("no Ethernet layer found")
+	}
+
+	eth, _ := ethLayer.(*layers.Ethernet)
+
+	// 获取TCP payload
+	tcpPayload := tcp.Payload
+	if len(tcpPayload) == 0 {
+		// 没有TCP数据，直接发送
+		return dstHandle.WritePacketData(data)
+	}
+
+	originalSeq := tcp.Seq
+	originalNextSeq := originalSeq + uint32(len(tcpPayload))
+
+	log.Printf("Processing TCP packet: %d bytes, seq=%d, next_seq=%d, payload=%d",
+		len(data), originalSeq, originalNextSeq, len(tcpPayload))
+
+	// 计算每个段的最大数据大小
+	// 以太网头(14) + IP头(20) + TCP头(20) = 54字节开销
+	const maxMTU = 1500
+	const headerOverhead = 14 + 20 + 20 // 以太网 + IP + TCP基本头部
+	maxSegmentData := maxMTU - headerOverhead
+
+	// 如果TCP payload小于等于最大段大小，直接发送
+	if len(tcpPayload) <= maxSegmentData {
+		log.Printf("TCP payload fits in single segment, sending as-is")
+		return dstHandle.WritePacketData(data)
+	}
+
+	// 分割TCP payload，保持序列号连续性
+	currentSeq := originalSeq
+	sentSegments := 0
+
+	for i := 0; i < len(tcpPayload); i += maxSegmentData {
+		end := i + maxSegmentData
+		if end > len(tcpPayload) {
+			end = len(tcpPayload)
+		}
+
+		segmentData := tcpPayload[i:end]
+		segmentNextSeq := currentSeq + uint32(len(segmentData))
+
+		// 创建新的TCP段，保持序列号连续性
+		newTCP := &layers.TCP{
+			SrcPort:    tcp.SrcPort,
+			DstPort:    tcp.DstPort,
+			Seq:        currentSeq,
+			Ack:        tcp.Ack,
+			DataOffset: 5, // 20字节TCP头部
+			Window:     tcp.Window,
+			Checksum:   0, // 将重新计算
+			Urgent:     0,
+		}
+
+		// 复制TCP标志，但对于中间段清除某些标志
+		newTCP.FIN = tcp.FIN && (end == len(tcpPayload)) // 只有最后一段保留FIN
+		newTCP.SYN = tcp.SYN && (i == 0)                 // 只有第一段保留SYN
+		newTCP.RST = tcp.RST
+		newTCP.PSH = tcp.PSH && (end == len(tcpPayload)) // 只有最后一段保留PSH
+		newTCP.ACK = tcp.ACK
+		newTCP.URG = tcp.URG && (i == 0) // 只有第一段保留URG
+
+		// 创建新的IP头
+		newIP := &layers.IPv4{
+			Version:    ip.Version,
+			IHL:        ip.IHL,
+			TOS:        ip.TOS,
+			Length:     uint16(20 + 20 + len(segmentData)), // IP头 + TCP头 + 数据
+			Id:         ip.Id + uint16(sentSegments),       // 递增IP ID
+			Flags:      ip.Flags,
+			FragOffset: ip.FragOffset,
+			TTL:        ip.TTL,
+			Protocol:   ip.Protocol,
+			Checksum:   0, // 将重新计算
+			SrcIP:      ip.SrcIP,
+			DstIP:      ip.DstIP,
+		}
+
+		// 创建新的以太网头
+		newEth := &layers.Ethernet{
+			SrcMAC:       eth.SrcMAC,
+			DstMAC:       eth.DstMAC,
+			EthernetType: eth.EthernetType,
+		}
+
+		// 设置校验和计算选项
+		newTCP.SetNetworkLayerForChecksum(newIP)
+
+		// 构建新包
+		buffer := gopacket.NewSerializeBuffer()
+		opts := gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		}
+
+		err := gopacket.SerializeLayers(buffer, opts,
+			newEth,
+			newIP,
+			newTCP,
+			gopacket.Payload(segmentData),
+		)
+
+		if err != nil {
+			log.Printf("Failed to serialize TCP segment %d: %v", sentSegments, err)
+			return err
+		}
+
+		// 发送段
+		segmentBytes := buffer.Bytes()
+		if err := dstHandle.WritePacketData(segmentBytes); err != nil {
+			log.Printf("Failed to send TCP segment %d (%d bytes, seq=%d, next_seq=%d): %v",
+				sentSegments, len(segmentBytes), currentSeq, segmentNextSeq, err)
+			return err
+		}
+
+		log.Printf("Sent TCP segment %d: %d bytes, seq=%d, next_seq=%d, data_len=%d",
+			sentSegments, len(segmentBytes), currentSeq, segmentNextSeq, len(segmentData))
+
+		// 更新序列号和计数器 - 关键：保持序列号连续性
+		currentSeq = segmentNextSeq
+		sentSegments++
+	}
+
+	// 验证序列号连续性
+	if currentSeq != originalNextSeq {
+		log.Printf("WARNING: Sequence number mismatch! Expected final seq=%d, got=%d",
+			originalNextSeq, currentSeq)
+	} else {
+		log.Printf("TCP segmentation completed successfully: %d segments, seq=%d->%d",
+			sentSegments, originalSeq, originalNextSeq)
+	}
+
+	return nil
 }
